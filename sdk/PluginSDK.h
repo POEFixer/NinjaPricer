@@ -1810,10 +1810,10 @@ public:
     void Log(const char* level, const char* message) const {
         if (m_abi && m_abi->log) m_abi->log(level, message ? message : "");
     }
-    void Debug(const char* message) const { Log("debug", message); }
-    void Info (const char* message) const { Log("info",  message); }
-    void Warn (const char* message) const { Log("warn",  message); }
-    void Error(const char* message) const { Log("error", message); }
+    void Debug(const char* message) const { Log("Debug",   message); }
+    void Info (const char* message) const { Log("Info",    message); }
+    void Warn (const char* message) const { Log("Warning", message); }
+    void Error(const char* message) const { Log("Error",   message); }
 };
 
 // Event subscriptions store heap-allocated std::function holders keyed by
