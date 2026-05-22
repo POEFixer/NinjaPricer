@@ -80,7 +80,7 @@ private:
             + encodedLeague + "/Currencies/ByCategory?Category=" + apiId
             + "&ReferenceCurrency=chaos&PerPage=250";
 
-        std::string jsonStr = NinjaApi::HttpGet(url);
+        std::string jsonStr = NinjaApi::HttpGet(url, logFn);
         bool ok = false;
 
         if (!jsonStr.empty()) {
@@ -92,7 +92,7 @@ private:
                 // Fetch remaining pages
                 for (int page = 2; page <= totalPages && page <= 20 && running.load(); page++) {
                     std::string pageUrl = url + "&Page=" + std::to_string(page);
-                    std::string pageJson = NinjaApi::HttpGet(pageUrl);
+                    std::string pageJson = NinjaApi::HttpGet(pageUrl, logFn);
                     if (!pageJson.empty()) {
                         int dummy = 0;
                         ParseCurrencyPage(pageJson, db, dummy);
@@ -136,7 +136,7 @@ private:
             + encodedLeague + "/Uniques/ByCategory?Category=" + apiId
             + "&ReferenceCurrency=chaos&PerPage=250";
 
-        std::string jsonStr = NinjaApi::HttpGet(url);
+        std::string jsonStr = NinjaApi::HttpGet(url, logFn);
         bool ok = false;
 
         if (!jsonStr.empty()) {
@@ -147,7 +147,7 @@ private:
 
                 for (int page = 2; page <= totalPages && page <= 20 && running.load(); page++) {
                     std::string pageUrl = url + "&Page=" + std::to_string(page);
-                    std::string pageJson = NinjaApi::HttpGet(pageUrl);
+                    std::string pageJson = NinjaApi::HttpGet(pageUrl, logFn);
                     if (!pageJson.empty()) {
                         int dummy = 0;
                         ParseUniquePage(pageJson, db, dummy);

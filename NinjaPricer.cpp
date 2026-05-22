@@ -144,6 +144,17 @@ public:
     void DrawTabDataSource() {
         ImGui::Spacing();
 
+        // English-only matching warning
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.85f, 0.2f, 1.0f));
+        ImGui::TextWrapped(
+            "Warning: POE2 must be set to English. Item names are matched "
+            "in English only - other languages will not work."
+        );
+        ImGui::PopStyleColor();
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+
         // Source selector
         ImGui::Text("Price Source:");
         int prevSource = m_DataSource;

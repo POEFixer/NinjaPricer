@@ -43,7 +43,7 @@ public:
             if (!currencyEnabled[i]) continue;
 
             std::string fullUrl = baseUrl + kCurrencyCategories[i].apiId;
-            std::string jsonStr = NinjaApi::HttpGet(fullUrl);
+            std::string jsonStr = NinjaApi::HttpGet(fullUrl, logFn);
 
             bool ok = false;
             if (!jsonStr.empty()) {
