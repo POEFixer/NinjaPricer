@@ -54,7 +54,7 @@
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
       <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
-      <AdditionalIncludeDirectories>$(ProjectDir)sdk;$(ProjectDir)imgui;$(ProjectDir)lib;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir);$(ProjectDir)sdk;$(ProjectDir)imgui;$(ProjectDir)lib;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
@@ -73,7 +73,7 @@
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
       <RuntimeLibrary>MultiThreadedDebugDLL</RuntimeLibrary>
-      <AdditionalIncludeDirectories>$(ProjectDir)sdk;$(ProjectDir)imgui;$(ProjectDir)lib;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir);$(ProjectDir)sdk;$(ProjectDir)imgui;$(ProjectDir)lib;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
@@ -89,10 +89,8 @@
     <ClCompile Include="imgui\imgui_widgets.cpp" />
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="sdk\PluginAPI.h" />
-    <ClInclude Include="sdk\PluginGameData.h" />
-    <ClInclude Include="sdk\PluginContext.h" />
-    <ClInclude Include="sdk\PluginHelpers.h" />
+    <ClInclude Include="sdk\PluginAbi.h" />
+    <ClInclude Include="sdk\PluginSDK.h" />
     <ClInclude Include="src\IPriceSource.h" />
     <ClInclude Include="src\NinjaApi.h" />
     <ClInclude Include="src\NinjaSource.h" />

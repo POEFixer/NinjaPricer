@@ -1,11 +1,13 @@
 // ============================================================================
-// NinjaPricer — multi-source price overlay plugin for POE2
+// NinjaPricer — multi-source price overlay plugin for POE2 (v6 SDK)
 // ============================================================================
 // Displays item prices from poe.ninja or poe2scout on dropped items and
 // in inventory.
 // ============================================================================
 
-#include "sdk/PluginHelpers.h"
+#include "sdk/PluginSDK.h"
+#include <imgui.h>
+
 #include "src/IPriceSource.h"
 #include "src/NinjaSource.h"
 #include "src/ScoutSource.h"
@@ -20,8 +22,8 @@
 #include <atomic>
 #include <unordered_map>
 #include <map>
+#include <algorithm>
 
-using namespace PluginSDK;
 using namespace PriceApi;
 
 // Fallback leagues if API fetch fails
@@ -63,53 +65,49 @@ static const char* GetVkName(int vk) {
     return buf;
 }
 
-class NinjaPricerPlugin : public IPlugin {
+// Bridge: PluginSDK::LogService -> PriceApi::LogFunc (C function pointer).
+// The price source threads expect a `void(*)(const char*, const char*)`. The
+// SDK LogService is an object, so we wrap it in a thread-local pointer and
+// expose a free function. Only used during fetch thread lifetime; SetActiveLog
+// is called before StartFetchThread and cleared in StopFetchThread.
+static thread_local const PluginSDK::LogService* tls_logSvc = nullptr;
+static void PriceApiLogBridge(const char* level, const char* msg) {
+    if (tls_logSvc) tls_logSvc->Log(level ? level : "Info", msg ? msg : "");
+}
+
+class NinjaPricerPlugin : public PluginSDK::Plugin {
 public:
-    ~NinjaPricerPlugin() {
+    ~NinjaPricerPlugin() override {
         StopFetchThread();
     }
 
     // ========================================================================
-    // IPlugin lifecycle
+    // PluginSDK::Plugin lifecycle
     // ========================================================================
 
-    void SetPluginDirectory(const char* dir) override {
-        m_Directory = dir;
-    }
+    const char* GetName() const override { return "Ninja Pricer"; }
+    bool WantsOverlay() const override { return true; }
 
-    void SetContext(PluginContext* context) override {
-        m_Context = context;
-        if (m_Context && m_Context->ImGuiContext) {
-            ImGui::SetCurrentContext(static_cast<ImGuiContext*>(m_Context->ImGuiContext));
-        }
-    }
-
-    void OnEnable(bool isGameOpened) override {
+    void OnEnable(bool /*isGameAttached*/) override {
+        if (ctx()->ImGuiContext)
+            ImGui::SetCurrentContext(static_cast<ImGuiContext*>(ctx()->ImGuiContext));
         LoadSettings();
         StartFetchThread();
-        if (m_Context) {
-            m_Context->Log("Info", "[NinjaPricer] Plugin enabled");
-        }
+        ctx()->Log.Info("[NinjaPricer] Plugin enabled");
     }
 
     void OnDisable() override {
         StopFetchThread();
-        if (m_Context) {
-            m_Context->Log("Info", "[NinjaPricer] Plugin disabled");
-        }
+        ctx()->Log.Info("[NinjaPricer] Plugin disabled");
     }
-
-    const char* GetName() override { return "Ninja Pricer"; }
-
-    bool WantsOverlay() override { return true; }
 
     // ========================================================================
     // Settings UI
     // ========================================================================
 
     void DrawSettings() override {
-        if (!m_Context) return;
-        ImGui::SetCurrentContext(static_cast<ImGuiContext*>(m_Context->ImGuiContext));
+        if (ctx()->ImGuiContext)
+            ImGui::SetCurrentContext(static_cast<ImGuiContext*>(ctx()->ImGuiContext));
 
         if (!ImGui::BeginTabBar("##NinjaPricerTabs")) return;
 
@@ -137,14 +135,9 @@ public:
         ImGui::EndTabBar();
     }
 
-    // ========================================================================
-    // Settings Tab Methods
-    // ========================================================================
-
     void DrawTabDataSource() {
         ImGui::Spacing();
 
-        // English-only matching warning
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.85f, 0.2f, 1.0f));
         ImGui::TextWrapped(
             "Warning: POE2 must be set to English. Item names are matched "
@@ -155,18 +148,15 @@ public:
         ImGui::Separator();
         ImGui::Spacing();
 
-        // Source selector
         ImGui::Text("Price Source:");
         int prevSource = m_DataSource;
         ImGui::RadioButton("poe.ninja", &m_DataSource, 0); ImGui::SameLine();
         ImGui::RadioButton("poe2scout", &m_DataSource, 1);
-        if (m_DataSource != prevSource) {
+        if (m_DataSource != prevSource)
             RestartFetchThread();
-        }
 
         ImGui::Spacing();
 
-        // League combo box
         ImGui::Text("League:");
         ImGui::SetNextItemWidth(250.0f);
 
@@ -191,22 +181,21 @@ public:
             ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, 1.0f), "Loading...");
         }
         else {
-            if (ImGui::Button("Refresh Prices")) {
+            if (ImGui::Button("Refresh Prices"))
                 TriggerRefresh();
-            }
         }
 
         ImGui::SliderInt("Refresh interval (min)", &m_RefreshIntervalMin, 15, 180);
 
         ImGui::Spacing();
 
-        // Status
         {
             std::shared_lock<std::shared_mutex> lock(m_DbMutex);
             if (m_PriceDb.loaded) {
                 auto elapsed = std::chrono::steady_clock::now() - m_PriceDb.lastUpdate;
                 auto mins = std::chrono::duration_cast<std::chrono::minutes>(elapsed).count();
-                ImGui::Text("Items loaded: %d | Updated %lld min ago", m_PriceDb.totalItems, (long long)mins);
+                ImGui::Text("Items loaded: %d | Updated %lld min ago",
+                    m_PriceDb.totalItems, (long long)mins);
                 ImGui::Text("Rates: 1 Divine = %.1f Chaos | 1 Exalted = %.1f Chaos",
                     m_PriceDb.divineInChaos, m_PriceDb.exaltedInChaos);
             }
@@ -230,7 +219,6 @@ public:
 
         ImGui::Separator();
 
-        // Price position for UI items (inventory/stash)
         ImGui::SetNextItemWidth(160.0f);
         int uiPos = static_cast<int>(m_UiPricePosition);
         if (ImGui::BeginCombo("Price position (Inventory/Stash)", kUiPositionNames[uiPos])) {
@@ -244,7 +232,6 @@ public:
         }
         m_UiPricePosition = static_cast<UiPricePosition>(uiPos);
 
-        // Price position for ground items
         ImGui::SetNextItemWidth(160.0f);
         int gndPos = static_cast<int>(m_GroundPricePosition);
         if (ImGui::BeginCombo("Price position (Ground items)", kGroundPositionNames[gndPos])) {
@@ -269,11 +256,11 @@ public:
 
         ImGui::Separator();
 
-        // Hotkey to hide prices
         ImGui::Text("Hold-to-hide hotkey:");
         ImGui::SameLine();
         if (m_CapturingHotkey) {
-            ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, 1.0f), "Press any key... (ESC to cancel)");
+            ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, 1.0f),
+                "Press any key... (ESC to cancel)");
             if (GetAsyncKeyState(VK_ESCAPE) & 0x8000) {
                 m_CapturingHotkey = false;
             }
@@ -297,9 +284,8 @@ public:
             }
             if (m_HideHotkey != 0) {
                 ImGui::SameLine();
-                if (ImGui::Button("Clear", ImVec2(60.0f, 0.0f))) {
+                if (ImGui::Button("Clear", ImVec2(60.0f, 0.0f)))
                     m_HideHotkey = 0;
-                }
             }
         }
     }
@@ -310,7 +296,6 @@ public:
         float availW = ImGui::GetContentRegionAvail().x;
         int columns = (availW > 600.0f) ? 4 : (availW > 400.0f) ? 3 : 2;
 
-        // --- Currency Categories ---
         ImGui::TextColored(ImVec4(0.6f, 0.8f, 1.0f, 1.0f), "Currency Categories");
         ImGui::Spacing();
         if (ImGui::BeginTable("##CurrCats", columns)) {
@@ -328,7 +313,6 @@ public:
         ImGui::Separator();
         ImGui::Spacing();
 
-        // --- Unique Categories (poe2scout only) ---
         ImGui::TextColored(ImVec4(0.6f, 0.8f, 1.0f, 1.0f), "Unique Categories (poe2scout only)");
         ImGui::Spacing();
         if (ImGui::BeginTable("##UniqCats", columns)) {
@@ -347,66 +331,64 @@ public:
     // ========================================================================
 
     void DrawUI() override {
-        if (!m_Context) return;
-        ImGui::SetCurrentContext(static_cast<ImGuiContext*>(m_Context->ImGuiContext));
+        if (ctx()->ImGuiContext)
+            ImGui::SetCurrentContext(static_cast<ImGuiContext*>(ctx()->ImGuiContext));
 
-        // Hide when game window is not focused
         if (m_HideWhenUnfocused && !IsGameWindowFocused()) return;
-
-        // Hide when hotkey is held
         if (m_HideHotkey != 0 && (GetAsyncKeyState(m_HideHotkey) & 0x8000)) return;
 
-        auto snap = m_Context->GetSnapshot();
-        if (!snap || !snap->IsAttached) return;
-        if (snap->CurrentState != GameStateTypes::InGameState) return;
+        PluginSDK::Snapshot snap = ctx()->Game.GetSnapshot();
+        if (!snap.IsAttached) return;
+        if (snap.State != PluginSDK::GameState::InGame) return;
 
-        // Check area change — clear name cache
-        if (snap->AreaChangeCounter != m_LastAreaChange) {
+        if (snap.AreaChangeCounter != m_LastAreaChange) {
             m_NameCache.clear();
-            m_InvRootIndex = -1;
-            m_StashRootIndex = -1;
-            m_LastAreaChange = snap->AreaChangeCounter;
+            m_LastAreaChange = snap.AreaChangeCounter;
         }
 
-        // Request inventory scan if needed (do before lock)
         if (m_ShowInventoryPrices || m_ShowOtherInventoryPrices) {
             auto now = std::chrono::steady_clock::now();
             if (now - m_LastInventoryScan > std::chrono::seconds(1)) {
-                if (m_Context->RequestInventoryScan)
-                    m_Context->RequestInventoryScan(-1);
+                ctx()->Inventory.Scan(-1);
                 m_LastInventoryScan = now;
             }
         }
 
-        // Acquire price data (shared lock) — ONE lock for the entire frame
         std::shared_lock<std::shared_mutex> lock(m_DbMutex);
         if (!m_PriceDb.loaded) return;
 
-        // Cache rate locally for GetPriceColor (avoids re-locking)
         m_CachedDivineInChaos = m_PriceDb.divineInChaos;
 
         if (m_ShowGroundPrices) {
             DrawGroundItemPrices(snap);
         }
 
-        if (m_ShowInventoryPrices && IsInventoryPanelVisible()) {
-            DrawInventoryPrices(snap);
+        // v6: FindPanelByStringId replaces the v5 brute-force scan over
+        // child indices 25-35.
+        uintptr_t gameUiRoot = ctx()->Ui.GetGameUiRoot();
+        uintptr_t inventoryPanel = 0;
+        uintptr_t stashPanel = 0;
+        if (gameUiRoot != 0) {
+            inventoryPanel = ctx()->Ui.FindPanelByStringId(gameUiRoot, "Inventory");
+            stashPanel = ctx()->Ui.FindPanelByStringId(gameUiRoot, "Stash");
         }
 
-        if (m_ShowOtherInventoryPrices) {
-            DrawStashPrices();
+        if (m_ShowInventoryPrices && inventoryPanel != 0
+            && ctx()->Ui.IsVisible(inventoryPanel)) {
+            DrawInventoryPrices();
+        }
+
+        if (m_ShowOtherInventoryPrices && stashPanel != 0
+            && ctx()->Ui.IsVisible(stashPanel)) {
+            DrawStashPrices(stashPanel);
         }
     }
 
-    // ========================================================================
-    // Settings Persistence
-    // ========================================================================
-
     void SaveSettings() override {
         namespace fs = std::filesystem;
-        fs::path configDir = fs::path(m_Directory) / "config";
-        if (!fs::exists(configDir))
-            fs::create_directories(configDir);
+        fs::path configDir = fs::path(Directory()) / "config";
+        std::error_code ec;
+        fs::create_directories(configDir, ec);
 
         try {
             nlohmann::json j;
@@ -442,15 +424,14 @@ public:
 
 private:
     // ========================================================================
-    // Debug Diagnostics Panel
+    // Debug Panel
     // ========================================================================
 
     void DrawDebugPanel() {
-        auto snap = m_Context->GetSnapshot();
+        PluginSDK::Snapshot snap = ctx()->Game.GetSnapshot();
 
         ImGui::Text("Source: %s", (m_DataSource == 0) ? "poe.ninja" : "poe2scout");
 
-        // --- Price Database ---
         ImGui::TextColored(ImVec4(0.6f, 0.8f, 1.0f, 1.0f), "Price Database:");
         {
             std::shared_lock<std::shared_mutex> lock(m_DbMutex);
@@ -460,13 +441,13 @@ private:
             ImGui::Text("  ExaltedInChaos: %.2f", m_PriceDb.exaltedInChaos);
             ImGui::Text("  Map size: %d", (int)m_PriceDb.items.size());
 
-            // Show first 10 items from DB
             if (m_PriceDb.loaded && ImGui::TreeNode("Sample DB entries (first 10)")) {
                 int count = 0;
                 for (auto& [key, item] : m_PriceDb.items) {
                     if (count++ >= 10) break;
                     ImGui::Text("  '%s' -> %.1f chaos (%.4f div)", key.c_str(), item.chaosValue,
-                        (m_PriceDb.divineInChaos > 0) ? item.chaosValue / m_PriceDb.divineInChaos : 0.0f);
+                        (m_PriceDb.divineInChaos > 0)
+                            ? item.chaosValue / m_PriceDb.divineInChaos : 0.0f);
                 }
                 ImGui::TreePop();
             }
@@ -474,26 +455,22 @@ private:
 
         ImGui::Separator();
 
-        if (!snap) {
-            ImGui::TextDisabled("No snapshot available");
-            return;
-        }
-
-        // --- Game State ---
         ImGui::TextColored(ImVec4(0.6f, 0.8f, 1.0f, 1.0f), "Game State:");
-        ImGui::Text("  Attached: %s", snap->IsAttached ? "YES" : "NO");
-        ImGui::Text("  State: %d (InGame=4)", (int)snap->CurrentState);
-        ImGui::Text("  Area: %s (level %d)", snap->CurrentAreaName.c_str(), snap->CurrentAreaLevel);
-        ImGui::Text("  IsHideout: %s, IsTown: %s", snap->IsHideout ? "YES" : "NO", snap->IsTown ? "YES" : "NO");
+        ImGui::Text("  Attached: %s", snap.IsAttached ? "YES" : "NO");
+        ImGui::Text("  State: %d (InGame=4)", (int)snap.State);
+        ImGui::Text("  Area: %s (level %d)",
+            snap.CurrentAreaName.c_str(), snap.CurrentAreaLevel);
+        ImGui::Text("  IsHideout: %s, IsTown: %s",
+            snap.IsHideout ? "YES" : "NO", snap.IsTown ? "YES" : "NO");
 
         ImGui::Separator();
 
-        // --- Entity Items ---
         ImGui::TextColored(ImVec4(0.6f, 0.8f, 1.0f, 1.0f), "Ground Items (Entities):");
-        int totalEntities = (int)snap->Entities.size();
+        int totalEntities = (int)snap.Entities.size();
         int worldItems = 0;
-        for (auto& e : snap->Entities) {
-            if (e.entityType == EntityTypes::Item && e.entitySubtype == EntitySubtypes::WorldItem)
+        for (const auto& e : snap.Entities) {
+            if (e.EntityType == PluginSDK::EntityType::Item
+                && e.EntitySubtype == PluginSDK::EntitySubtype::WorldItem)
                 worldItems++;
         }
         ImGui::Text("  Total entities: %d", totalEntities);
@@ -502,8 +479,9 @@ private:
 
         if (worldItems > 0 && ImGui::TreeNode("WorldItem details (first 5)")) {
             int count = 0;
-            for (auto& e : snap->Entities) {
-                if (e.entityType != EntityTypes::Item || e.entitySubtype != EntitySubtypes::WorldItem) continue;
+            for (const auto& e : snap.Entities) {
+                if (e.EntityType != PluginSDK::EntityType::Item
+                    || e.EntitySubtype != PluginSDK::EntitySubtype::WorldItem) continue;
                 if (count++ >= 5) break;
 
                 std::string name = GetEntityLookupName(e);
@@ -512,17 +490,20 @@ private:
                 std::shared_lock<std::shared_mutex> lock(m_DbMutex);
                 auto price = LookupPrice(m_PriceDb, name);
 
-                ImGui::Text("  ID:%u Addr:0x%llX Valid:%d", e.Id, (unsigned long long)e.Address, e.IsValid);
+                ImGui::Text("  ID:%u Addr:0x%llX Valid:%d",
+                    e.Id, (unsigned long long)e.Address, (int)e.IsValid);
                 ImGui::Text("    Name: '%s'", name.c_str());
                 ImGui::Text("    Pos: (%.0f, %.0f, %.0f) Zone:%d",
                     e.WorldX, e.WorldY, e.WorldZ, (int)e.Zone);
-                if (m_Context->WorldToScreen) {
-                    float sx, sy;
-                    bool vis = m_Context->WorldToScreen(e.WorldX, e.WorldY, e.WorldZ, &sx, &sy);
-                    ImGui::Text("    Screen: (%.0f, %.0f) Visible:%s", sx, sy, vis ? "YES" : "NO");
-                }
+                float sx, sy;
+                bool vis = ctx()->Render.WorldToScreen(e.WorldX, e.WorldY, e.WorldZ, sx, sy);
+                ImGui::Text("    Screen: (%.0f, %.0f) Visible:%s",
+                    sx, sy, vis ? "YES" : "NO");
                 ImGui::Text("    Price found: %s%s", price.found ? "YES" : "NO",
-                    price.found ? (std::string(" -> ") + FormatPrice(GetDisplayValue(price, m_DisplayCurrency), m_DisplayCurrency)).c_str() : "");
+                    price.found
+                    ? (std::string(" -> ") + FormatPrice(
+                        GetDisplayValue(price, m_DisplayCurrency), m_DisplayCurrency)).c_str()
+                    : "");
                 ImGui::Spacing();
             }
             ImGui::TreePop();
@@ -530,33 +511,23 @@ private:
 
         ImGui::Separator();
 
-        // --- Inventory ---
+        std::vector<PluginSDK::Inventory> invs = ctx()->Inventory.GetAll();
         ImGui::TextColored(ImVec4(0.6f, 0.8f, 1.0f, 1.0f), "Inventory Data:");
-        ImGui::Text("  Inventories in snapshot: %d", (int)snap->Inventories.size());
-        ImGui::Text("  RequestInventoryScan: %s", m_Context->RequestInventoryScan ? "available" : "NULL");
-        ImGui::Text("  GetInventoryName: %s", m_Context->GetInventoryName ? "available" : "NULL");
+        ImGui::Text("  Inventories available: %d", (int)invs.size());
 
-        // InventoryGrid info
-        auto& grid = snap->InventoryGrid;
-        ImGui::Text("  InventoryGrid.IsValid: %s", grid.IsValid ? "YES" : "NO");
-        if (grid.IsValid) {
-            ImGui::Text("    ScreenPos: (%.0f, %.0f)", grid.GridScreenX, grid.GridScreenY);
-            ImGui::Text("    Size: (%.0f x %.0f)", grid.GridWidth, grid.GridHeight);
-            ImGui::Text("    CellSize: %.1f", grid.CellSize);
-            ImGui::Text("    UiAddress: 0x%llX", (unsigned long long)grid.UiAddress);
-        }
+        for (const auto& inv : invs) {
+            const char* invName = ctx()->Inventory.GetName(inv.InventoryId);
+            if (!invName) invName = "(unknown)";
 
-        // Per-inventory details
-        for (const auto& inv : snap->Inventories) {
-            const char* invName = "(unknown)";
-            if (m_Context->GetInventoryName) {
-                const char* n = m_Context->GetInventoryName(inv.Id);
-                if (n) invName = n;
-            }
-
-            if (ImGui::TreeNode((void*)(intptr_t)inv.Id, "Inventory #%d '%s' (%dx%d, %d items)",
-                inv.Id, invName, inv.TotalBoxesX, inv.TotalBoxesY, (int)inv.Items.size()))
+            if (ImGui::TreeNode((void*)(intptr_t)inv.InventoryId,
+                "Inventory #%d '%s' (%dx%d, %d items)",
+                inv.InventoryId, invName, inv.TotalBoxesX, inv.TotalBoxesY,
+                (int)inv.Items.size()))
             {
+                ImGui::Text("  Grid: valid=%s pos=(%.0f, %.0f) cell=%.1f",
+                    inv.Grid.Valid ? "YES" : "NO",
+                    inv.Grid.GridScreenX, inv.Grid.GridScreenY, inv.Grid.CellSize);
+
                 int matchCount = 0;
                 for (const auto& item : inv.Items) {
                     std::string dn = GetItemLookupName(item);
@@ -564,22 +535,25 @@ private:
                     auto price = LookupPrice(m_PriceDb, dn);
                     if (price.found) matchCount++;
                 }
-                ImGui::Text("  Items with price match: %d / %d", matchCount, (int)inv.Items.size());
+                ImGui::Text("  Items with price match: %d / %d",
+                    matchCount, (int)inv.Items.size());
 
                 if (ImGui::TreeNode("Item list (first 10)")) {
                     int count = 0;
                     for (const auto& item : inv.Items) {
                         if (count++ >= 10) break;
-
                         std::string dn = GetItemLookupName(item);
 
                         std::shared_lock<std::shared_mutex> lock(m_DbMutex);
                         auto price = LookupPrice(m_PriceDb, dn);
 
                         ImGui::Text("  [%d,%d] Lookup:'%s' (stack:%d) path:'%s'",
-                            item.SlotX, item.SlotY, dn.c_str(), item.StackCount, item.Path.c_str());
-                        ImGui::Text("    Price: %s", price.found ? FormatPrice(
-                            GetDisplayValue(price, m_DisplayCurrency), m_DisplayCurrency).c_str() : "NOT FOUND");
+                            item.SlotX, item.SlotY, dn.c_str(),
+                            item.StackCount, item.Path.c_str());
+                        ImGui::Text("    Price: %s", price.found
+                            ? FormatPrice(GetDisplayValue(price, m_DisplayCurrency),
+                                m_DisplayCurrency).c_str()
+                            : "NOT FOUND");
                     }
                     ImGui::TreePop();
                 }
@@ -589,49 +563,43 @@ private:
 
         ImGui::Separator();
 
-        // --- Rendering check ---
         ImGui::TextColored(ImVec4(0.6f, 0.8f, 1.0f, 1.0f), "Rendering:");
-        ImGui::Text("  WorldToScreen: %s", m_Context->WorldToScreen ? "available" : "NULL");
-        ImGui::Text("  ReadItemBaseTypeName: %s", m_Context->ReadItemBaseTypeName ? "available" : "NULL");
-        ImGui::Text("  ReadItemStackCount: %s", m_Context->ReadItemStackCount ? "available" : "NULL");
         ImGui::Text("  IsOverlayMode: %s",
-            (m_Context->IsOverlayMode && m_Context->IsOverlayMode()) ? "YES" : "NO");
-        ImGui::Text("  Screen: %dx%d", snap->ScreenWidth, snap->ScreenHeight);
+            ctx()->Game.IsOverlayMode() ? "YES" : "NO");
+        ImGui::Text("  Screen: %dx%d", snap.ScreenWidth, snap.ScreenHeight);
     }
 
     // ========================================================================
     // Ground Item Prices (via UI tree: GameUi[7][0][0] and [7][0][1])
     // ========================================================================
 
-    void DrawGroundItemPrices(const std::shared_ptr<const PluginGameSnapshot>& snap) {
-        uintptr_t gameUiAddr = GetGameUiAddr();
+    void DrawGroundItemPrices(const PluginSDK::Snapshot& /*snap*/) {
+        uintptr_t gameUiAddr = ctx()->Ui.GetGameUiRoot();
         if (gameUiAddr == 0) return;
 
         ImDrawList* dl = ImGui::GetForegroundDrawList();
         float baseFontSize = ImGui::GetFontSize() * m_TextScale;
 
-        // GameUi[7][0] — item container base
         const int containerIndices[] = { 7, 0 };
-        uintptr_t containerBase = m_Context->ReadUiChildChain(gameUiAddr, containerIndices, 2);
+        uintptr_t containerBase = ctx()->Ui.FollowPath(gameUiAddr, containerIndices, 2);
         if (containerBase == 0) return;
 
         // Both containers: [0]=normal, [1]=hovered
         for (int ci = 0; ci < 2; ci++) {
-            uintptr_t containerAddr = m_Context->GetUiChildAt(containerBase, ci);
+            uintptr_t containerAddr = ctx()->Ui.GetChildAt(containerBase, ci);
             if (containerAddr == 0) continue;
 
-            auto children = m_Context->GetUiChildren(containerAddr);
+            auto children = ctx()->Ui.GetChildren(containerAddr);
             for (uintptr_t childAddr : children) {
                 if (childAddr == 0) continue;
-                if (!m_Context->IsUiElementVisible(childAddr)) continue;
+                if (!ctx()->Ui.IsVisible(childAddr)) continue;
 
-                auto elemData = m_Context->ReadUiElement(childAddr);
+                PluginSDK::UiElement elemData = ctx()->Ui.Read(childAddr);
                 if (elemData.ElementType != 0x4084) continue;
 
-                std::string itemName = m_Context->GetUiStringId(childAddr);
+                std::string itemName = ctx()->Ui.GetStringId(childAddr);
                 if (itemName.empty()) continue;
 
-                // Parse stack prefix: "2x Divine Orb" → multiplier=2, name="Divine Orb"
                 int stackMultiplier = 1;
                 std::string lookupName = ParseGroundItemName(itemName, stackMultiplier);
                 if (lookupName.empty()) continue;
@@ -639,7 +607,6 @@ private:
                 PriceLookupResult price = LookupPrice(m_PriceDb, lookupName);
                 if (!price.found) continue;
 
-                // Unique category: ground item name must contain the unique item's name
                 if (IsUniqueCategory(price.category)) {
                     std::string lowerLookup = ToLower(lookupName);
                     std::string lowerUnique = ToLower(price.itemName);
@@ -650,9 +617,8 @@ private:
                 float displayValue = GetDisplayValue(price, m_DisplayCurrency) * stackMultiplier;
                 if (displayValue < 0.001f) continue;
 
-                // Get screen position via full parent-chain computation
                 float posX, posY, sizeW, sizeH;
-                if (!m_Context->ComputeUiScreenRect(childAddr, &posX, &posY, &sizeW, &sizeH))
+                if (!ctx()->Ui.ComputeScreenRect(childAddr, posX, posY, sizeW, sizeH))
                     continue;
                 if (sizeW < 1.0f) continue;
 
@@ -661,159 +627,36 @@ private:
                 float sw = ts.x * (baseFontSize / ImGui::GetFontSize());
                 float sh = ts.y * (baseFontSize / ImGui::GetFontSize());
 
-                // Position based on ground price position setting
                 float textX, textY;
                 CalcGroundPricePos(posX, posY, sizeW, sizeH, sw, sh, baseFontSize, textX, textY);
 
-                DrawPriceLabelAt(dl, baseFontSize, textX, textY, sw, sh, text, price.chaosValue * stackMultiplier);
+                DrawPriceLabelAt(dl, baseFontSize, textX, textY, sw, sh, text,
+                                 price.chaosValue * stackMultiplier);
             }
         }
     }
 
     // ========================================================================
-    // Inventory Prices (via InventoryGrid, only when panel visible)
+    // Inventory Prices — uses InventoryService::Get(1) for main inventory
     // ========================================================================
 
-    void DrawInventoryPrices(const std::shared_ptr<const PluginGameSnapshot>& snap) {
-        if (snap->Inventories.empty()) return;
-
-        const auto& grid = snap->InventoryGrid;
-        if (!grid.IsValid || grid.CellSize < 1.0f) return;
+    void DrawInventoryPrices() {
+        PluginSDK::Inventory inv = ctx()->Inventory.Get(1);  // main inventory
+        if (inv.InventoryId != 1) return;
+        if (!inv.Grid.Valid || inv.Grid.CellSize < 1.0f) return;
 
         ImDrawList* dl = ImGui::GetForegroundDrawList();
         float baseFontSize = ImGui::GetFontSize() * m_TextScale;
 
-        for (const auto& inv : snap->Inventories) {
-            // Only main inventory (ID 1)
-            if (inv.Id != 1) continue;
+        for (const auto& item : inv.Items) {
+            std::string displayName = GetItemLookupName(item);
+            if (displayName.empty()) continue;
 
-            for (const auto& item : inv.Items) {
-                std::string displayName = GetItemLookupName(item);
-                if (displayName.empty()) continue;
-
-                PriceLookupResult price = LookupPrice(m_PriceDb, displayName);
-                if (!price.found) continue;
-
-                // Unique category: verify item is actually unique rarity
-                if (IsUniqueCategory(price.category) && m_Context->ReadItemRarity && item.Address) {
-                    if (m_Context->ReadItemRarity(item.Address) != 3)
-                        continue;
-                }
-
-                int multiplier = (item.StackCount > 1) ? item.StackCount : 1;
-                float displayValue = GetDisplayValue(price, m_DisplayCurrency) * multiplier;
-                if (displayValue < 0.001f) continue;
-
-                std::string text = FormatPrice(displayValue, m_DisplayCurrency);
-
-                float cellX = grid.GridScreenX + item.SlotX * grid.CellSize;
-                float cellY = grid.GridScreenY + item.SlotY * grid.CellSize;
-                float cellW = item.Width * grid.CellSize;
-                float cellH = item.Height * grid.CellSize;
-
-                // Auto-adaptive text size for small cells
-                float fontSize = ComputeAdaptiveFontSize(baseFontSize, cellW, cellH);
-
-                ImVec2 ts = ImGui::CalcTextSize(text.c_str());
-                float sw = ts.x * (fontSize / ImGui::GetFontSize());
-                float sh = ts.y * (fontSize / ImGui::GetFontSize());
-
-                float labelX, labelY;
-                CalcUiPricePos(cellX, cellY, cellW, cellH, sw, sh, 2.0f, labelX, labelY);
-
-                DrawPriceLabelAt(dl, fontSize, labelX, labelY, sw, sh, text, price.chaosValue * multiplier);
-            }
-        }
-    }
-
-    // ========================================================================
-    // Stash Prices (inventory-data-driven, position-based rendering)
-    // ========================================================================
-
-    void DrawStashPrices() {
-        uintptr_t gameUiAddr = GetGameUiAddr();
-        if (gameUiAddr == 0) return;
-
-        // Find stash root by brute-force (cached)
-        if (m_StashRootIndex < 0) {
-            DiscoverPanelIndex(gameUiAddr, "Stash", 25, 35, m_StashRootIndex);
-        }
-        if (m_StashRootIndex < 0) return;
-
-        // Check stash root is visible
-        uintptr_t stashRoot = m_Context->GetUiChildAt(gameUiAddr, m_StashRootIndex);
-        if (stashRoot == 0 || !m_Context->IsUiElementVisible(stashRoot)) return;
-
-        // Request stash inventory scan (IDs start from 133)
-        auto now = std::chrono::steady_clock::now();
-        if (now - m_LastStashScan > std::chrono::seconds(1)) {
-            if (m_Context->RequestInventoryScan)
-                m_Context->RequestInventoryScan(-1); // Scan all to include stash tabs
-            m_LastStashScan = now;
-        }
-
-        // Navigate: root→2→0→0→0→1→1 → tab list
-        const int tabListIndices[] = { 2, 0, 0, 0, 1, 1 };
-        uintptr_t tabList = m_Context->ReadUiChildChain(stashRoot, tabListIndices, 6);
-        if (tabList == 0) return;
-
-        // Find active (visible) tab and its index
-        auto tabs = m_Context->GetUiChildren(tabList);
-        int activeTabIdx = -1;
-        for (int i = 0; i < (int)tabs.size(); i++) {
-            if (tabs[i] != 0 && m_Context->IsUiElementVisible(tabs[i])) {
-                activeTabIdx = i;
-                break;
-            }
-        }
-        if (activeTabIdx < 0) return;
-
-        // Get stash inventory for active tab: inventory IDs start from 133
-        int stashInvId = 133 + activeTabIdx;
-        auto snap = m_Context->GetSnapshot();
-        if (!snap) return;
-
-        // Find the matching stash inventory from snapshot
-        const InventoryInfo* stashInv = nullptr;
-        for (const auto& inv : snap->Inventories) {
-            if (inv.Id == stashInvId) {
-                stashInv = &inv;
-                break;
-            }
-        }
-        // No inventory data or empty — nothing to render
-        if (!stashInv || stashInv->Items.empty()) return;
-        if (stashInv->TotalBoxesX <= 0 || stashInv->TotalBoxesY <= 0) return;
-
-        // Get the item container UI for screen position
-        uintptr_t activeTabAddr = tabs[activeTabIdx];
-        const int itemContainerIndices[] = { 0, 0 };
-        uintptr_t itemContainer = m_Context->ReadUiChildChain(activeTabAddr, itemContainerIndices, 2);
-        if (itemContainer == 0) return;
-
-        float containerX, containerY, containerW, containerH;
-        if (!m_Context->ComputeUiScreenRect(itemContainer, &containerX, &containerY, &containerW, &containerH))
-            return;
-        if (containerW < 1.0f || containerH < 1.0f) return;
-
-        // Compute cell size from container and grid dimensions
-        float cellW = containerW / static_cast<float>(stashInv->TotalBoxesX);
-        float cellH = containerH / static_cast<float>(stashInv->TotalBoxesY);
-
-        ImDrawList* dl = ImGui::GetForegroundDrawList();
-        float baseFontSize = ImGui::GetFontSize() * m_TextScale;
-
-        // Iterate inventory items — only draw prices for items with a match in DB
-        for (const auto& item : stashInv->Items) {
-            std::string dn = GetItemLookupName(item);
-            if (dn.empty()) continue;
-
-            PriceLookupResult price = LookupPrice(m_PriceDb, dn);
+            PriceLookupResult price = LookupPrice(m_PriceDb, displayName);
             if (!price.found) continue;
 
-            // Unique category: verify item is actually unique rarity
-            if (IsUniqueCategory(price.category) && m_Context->ReadItemRarity && item.Address) {
-                if (m_Context->ReadItemRarity(item.Address) != 3)
+            if (IsUniqueCategory(price.category) && item.Address) {
+                if (ctx()->Inventory.ReadItemRarity(item.Address) != 3)
                     continue;
             }
 
@@ -823,13 +666,98 @@ private:
 
             std::string text = FormatPrice(displayValue, m_DisplayCurrency);
 
-            // Compute item screen position from grid
+            float cellX = inv.Grid.GridScreenX + item.SlotX * inv.Grid.CellSize;
+            float cellY = inv.Grid.GridScreenY + item.SlotY * inv.Grid.CellSize;
+            float cellW = item.Width * inv.Grid.CellSize;
+            float cellH = item.Height * inv.Grid.CellSize;
+
+            float fontSize = ComputeAdaptiveFontSize(baseFontSize, cellW, cellH);
+
+            ImVec2 ts = ImGui::CalcTextSize(text.c_str());
+            float sw = ts.x * (fontSize / ImGui::GetFontSize());
+            float sh = ts.y * (fontSize / ImGui::GetFontSize());
+
+            float labelX, labelY;
+            CalcUiPricePos(cellX, cellY, cellW, cellH, sw, sh, 2.0f, labelX, labelY);
+
+            DrawPriceLabelAt(dl, fontSize, labelX, labelY, sw, sh, text,
+                             price.chaosValue * multiplier);
+        }
+    }
+
+    // ========================================================================
+    // Stash Prices — inventory-data-driven, position-based rendering
+    // ========================================================================
+
+    void DrawStashPrices(uintptr_t stashRoot) {
+        if (stashRoot == 0) return;
+
+        // Navigate: root→2→0→0→0→1→1 → tab list
+        const int tabListIndices[] = { 2, 0, 0, 0, 1, 1 };
+        uintptr_t tabList = ctx()->Ui.FollowPath(stashRoot, tabListIndices, 6);
+        if (tabList == 0) return;
+
+        auto tabs = ctx()->Ui.GetChildren(tabList);
+        int activeTabIdx = -1;
+        for (int i = 0; i < (int)tabs.size(); i++) {
+            if (tabs[i] != 0 && ctx()->Ui.IsVisible(tabs[i])) {
+                activeTabIdx = i;
+                break;
+            }
+        }
+        if (activeTabIdx < 0) return;
+
+        auto now = std::chrono::steady_clock::now();
+        if (now - m_LastStashScan > std::chrono::seconds(1)) {
+            ctx()->Inventory.Scan(-1);
+            m_LastStashScan = now;
+        }
+
+        int stashInvId = 133 + activeTabIdx;
+        PluginSDK::Inventory stashInv = ctx()->Inventory.Get(stashInvId);
+        if (stashInv.Items.empty()) return;
+        if (stashInv.TotalBoxesX <= 0 || stashInv.TotalBoxesY <= 0) return;
+
+        uintptr_t activeTabAddr = tabs[activeTabIdx];
+        const int itemContainerIndices[] = { 0, 0 };
+        uintptr_t itemContainer = ctx()->Ui.FollowPath(activeTabAddr, itemContainerIndices, 2);
+        if (itemContainer == 0) return;
+
+        float containerX, containerY, containerW, containerH;
+        if (!ctx()->Ui.ComputeScreenRect(itemContainer,
+                                          containerX, containerY, containerW, containerH))
+            return;
+        if (containerW < 1.0f || containerH < 1.0f) return;
+
+        float cellW = containerW / static_cast<float>(stashInv.TotalBoxesX);
+        float cellH = containerH / static_cast<float>(stashInv.TotalBoxesY);
+
+        ImDrawList* dl = ImGui::GetForegroundDrawList();
+        float baseFontSize = ImGui::GetFontSize() * m_TextScale;
+
+        for (const auto& item : stashInv.Items) {
+            std::string dn = GetItemLookupName(item);
+            if (dn.empty()) continue;
+
+            PriceLookupResult price = LookupPrice(m_PriceDb, dn);
+            if (!price.found) continue;
+
+            if (IsUniqueCategory(price.category) && item.Address) {
+                if (ctx()->Inventory.ReadItemRarity(item.Address) != 3)
+                    continue;
+            }
+
+            int multiplier = (item.StackCount > 1) ? item.StackCount : 1;
+            float displayValue = GetDisplayValue(price, m_DisplayCurrency) * multiplier;
+            if (displayValue < 0.001f) continue;
+
+            std::string text = FormatPrice(displayValue, m_DisplayCurrency);
+
             float posX = containerX + item.SlotX * cellW;
             float posY = containerY + item.SlotY * cellH;
             float itemW = item.Width * cellW;
             float itemH = item.Height * cellH;
 
-            // Auto-adaptive text size for small cells
             float fontSize = ComputeAdaptiveFontSize(baseFontSize, itemW, itemH);
 
             ImVec2 ts = ImGui::CalcTextSize(text.c_str());
@@ -839,7 +767,8 @@ private:
             float labelX, labelY;
             CalcUiPricePos(posX, posY, itemW, itemH, sw, sh, 2.0f, labelX, labelY);
 
-            DrawPriceLabelAt(dl, fontSize, labelX, labelY, sw, sh, text, price.chaosValue * multiplier);
+            DrawPriceLabelAt(dl, fontSize, labelX, labelY, sw, sh, text,
+                             price.chaosValue * multiplier);
         }
     }
 
@@ -857,18 +786,14 @@ private:
             PriceApi::GetPriceColor(chaosValue, m_CachedDivineInChaos), text.c_str());
     }
 
-    // Compute adaptive font size for small item cells
     float ComputeAdaptiveFontSize(float baseFontSize, float cellW, float cellH) {
         float minDim = (cellW < cellH) ? cellW : cellH;
-        // Text should be at most 35% of the smaller dimension
         float maxTextH = minDim * 0.35f;
-        if (baseFontSize > maxTextH && maxTextH > 6.0f) {
+        if (baseFontSize > maxTextH && maxTextH > 6.0f)
             return maxTextH;
-        }
         return baseFontSize;
     }
 
-    // Calculate price label position for UI items (inventory/stash)
     void CalcUiPricePos(float cellX, float cellY, float cellW, float cellH,
         float textW, float textH, float pad, float& outX, float& outY)
     {
@@ -893,7 +818,6 @@ private:
         }
     }
 
-    // Calculate price label position for ground items (relative to item label)
     void CalcGroundPricePos(float labelX, float labelY, float labelW, float labelH,
         float textW, float textH, float fontSize, float& outX, float& outY)
     {
@@ -920,7 +844,7 @@ private:
     }
 
     // ========================================================================
-    // League Discovery (cached, fetched once on first access)
+    // League Discovery
     // ========================================================================
 
     const std::vector<std::string>& GetLeagues() {
@@ -928,7 +852,6 @@ private:
             m_LeaguesFetched = true;
             m_Leagues = NinjaApi::FetchLeagues();
             if (m_Leagues.empty()) {
-                // Fallback to hardcoded list
                 for (const char* name : kFallbackLeagues)
                     m_Leagues.push_back(name);
             }
@@ -945,113 +868,55 @@ private:
         if (!fg) return false;
         wchar_t title[256] = {};
         GetWindowTextW(fg, title, 256);
-        // Match game window or overlay window
         return (wcsstr(title, L"Path of Exile") != nullptr ||
                 wcsstr(title, L"POEFixer") != nullptr);
     }
 
     // ========================================================================
-    // UI Tree Helpers (via SDK v5)
+    // Item-name helpers
     // ========================================================================
 
-    uintptr_t GetGameUiAddr() {
-        if (!m_Context->GetGameUiRootAddress) return 0;
-        return m_Context->GetGameUiRootAddress();
-    }
-
-    // Discover panel index by brute-force scanning GameUi children
-    // Checks child[N]→child[1]→StringId == target
-    void DiscoverPanelIndex(uintptr_t gameUiAddr, const std::string& targetId,
-        int minIdx, int maxIdx, int& outIndex)
-    {
-        for (int idx = minIdx; idx <= maxIdx; idx++) {
-            uintptr_t rootAddr = m_Context->GetUiChildAt(gameUiAddr, idx);
-            if (rootAddr == 0) continue;
-            uintptr_t headerAddr = m_Context->GetUiChildAt(rootAddr, 1);
-            if (headerAddr == 0) continue;
-
-            std::string stringId = m_Context->GetUiStringId(headerAddr);
-            if (stringId == targetId) {
-                outIndex = idx;
-                return;
-            }
-        }
-    }
-
-    // Check if inventory panel is visible (brute-force find "Inventory")
-    bool IsInventoryPanelVisible() {
-        uintptr_t gameUiAddr = GetGameUiAddr();
-        if (gameUiAddr == 0) return false;
-
-        if (m_InvRootIndex < 0) {
-            DiscoverPanelIndex(gameUiAddr, "Inventory", 25, 35, m_InvRootIndex);
-        }
-        if (m_InvRootIndex < 0) return false;
-
-        uintptr_t invRoot = m_Context->GetUiChildAt(gameUiAddr, m_InvRootIndex);
-        return invRoot != 0 && m_Context->IsUiElementVisible(invRoot);
-    }
-
-    // Parse "2x Divine Orb" → multiplier=2, return "Divine Orb"
-    // Parse "Divine Orb" → multiplier=1, return "Divine Orb"
     static std::string ParseGroundItemName(const std::string& raw, int& outMultiplier) {
         outMultiplier = 1;
         if (raw.size() < 3) return raw;
 
-        // Check for pattern: digit(s) + 'x' + ' ' at the start
         size_t i = 0;
         while (i < raw.size() && raw[i] >= '0' && raw[i] <= '9') i++;
-        if (i > 0 && i < raw.size() && raw[i] == 'x' && i + 1 < raw.size() && raw[i + 1] == ' ') {
+        if (i > 0 && i < raw.size() && raw[i] == 'x'
+            && i + 1 < raw.size() && raw[i + 1] == ' ') {
             outMultiplier = std::atoi(raw.c_str());
             if (outMultiplier < 1) outMultiplier = 1;
-            return raw.substr(i + 2); // Skip "Nx "
+            return raw.substr(i + 2);
         }
         return raw;
     }
 
-    std::string GetItemBaseTypeName(const RadarEntity& entity) {
-        // Check cache first
+    std::string GetItemBaseTypeName(const PluginSDK::Entity& entity) {
         auto it = m_NameCache.find(entity.Id);
         if (it != m_NameCache.end()) return it->second;
 
-        // Read base type name (e.g., "Chaos Orb") via Base component
-        std::string name;
-        if (m_Context->ReadItemBaseTypeName) {
-            name = m_Context->ReadItemBaseTypeName(entity.Address);
-        }
-
-        // Cache result (even if empty, to avoid repeated reads)
+        std::string name = ctx()->Inventory.ReadItemBaseTypeName(entity.Address);
         m_NameCache[entity.Id] = name;
         return name;
     }
 
-    // Returns the best name for price lookup: UniqueName for uniques, BaseTypeName for others.
-    // For inventory items (have UniqueName/BaseTypeName fields).
-    std::string GetItemLookupName(const PluginSDK::InventoryItemInfo& item) {
-        // Prefer UniqueName for unique items (e.g., "Headhunter")
+    std::string GetItemLookupName(const PluginSDK::InventoryItem& item) {
         if (!item.UniqueName.empty())
             return item.UniqueName;
-        // Fallback: read UniqueName via function if field is empty but address available
-        if (m_Context->ReadItemUniqueName && item.Address) {
-            std::string un = m_Context->ReadItemUniqueName(item.Address);
+        if (item.Address) {
+            std::string un = ctx()->Inventory.ReadItemUniqueName(item.Address);
             if (!un.empty()) return un;
         }
-        // Non-unique: use BaseTypeName (e.g., "Divine Orb")
         if (!item.BaseTypeName.empty())
             return item.BaseTypeName;
-        if (m_Context->ReadItemBaseTypeName && item.Address)
-            return m_Context->ReadItemBaseTypeName(item.Address);
+        if (item.Address)
+            return ctx()->Inventory.ReadItemBaseTypeName(item.Address);
         return "";
     }
 
-    // Returns the best name for price lookup for world/radar entities.
-    std::string GetEntityLookupName(const RadarEntity& entity) {
-        // Try unique name first
-        if (m_Context->ReadItemUniqueName) {
-            std::string un = m_Context->ReadItemUniqueName(entity.Address);
-            if (!un.empty()) return un;
-        }
-        // Fallback to base type name
+    std::string GetEntityLookupName(const PluginSDK::Entity& entity) {
+        std::string un = ctx()->Inventory.ReadItemUniqueName(entity.Address);
+        if (!un.empty()) return un;
         return GetItemBaseTypeName(entity);
     }
 
@@ -1064,6 +929,8 @@ private:
         m_Running.store(true);
 
         m_FetchThread = std::thread([this]() {
+            // Make the SDK log service available to PriceApiLogBridge on this thread.
+            tls_logSvc = &ctx()->Log;
             while (m_Running.load()) {
                 {
                     PriceDatabase tempDb;
@@ -1071,9 +938,10 @@ private:
                         ? static_cast<IPriceSource&>(m_NinjaSource)
                         : static_cast<IPriceSource&>(m_ScoutSource);
                     source.FetchCategories(
-                        m_League, m_Directory, m_CurrencyEnabled, m_UniqueEnabled,
+                        m_League, std::string(Directory()),
+                        m_CurrencyEnabled, m_UniqueEnabled,
                         tempDb, m_IsLoading, m_Running,
-                        m_Context ? m_Context->Log : nullptr);
+                        &PriceApiLogBridge);
 
                     if (m_Running.load()) {
                         std::unique_lock<std::shared_mutex> lock(m_DbMutex);
@@ -1089,6 +957,7 @@ private:
                     }
                 }
             }
+            tls_logSvc = nullptr;
         });
     }
 
@@ -1117,7 +986,7 @@ private:
 
     void LoadSettings() {
         namespace fs = std::filesystem;
-        fs::path settingsPath = fs::path(m_Directory) / "config" / "settings.json";
+        fs::path settingsPath = fs::path(Directory()) / "config" / "settings.json";
         if (!fs::exists(settingsPath)) return;
 
         try {
@@ -1130,27 +999,32 @@ private:
             if (j.contains("league") && j["league"].is_string())
                 m_League = j["league"].get<std::string>();
             if (j.contains("displayCurrency") && j["displayCurrency"].is_number_integer())
-                m_DisplayCurrency = static_cast<DisplayCurrency>(j["displayCurrency"].get<int>());
+                m_DisplayCurrency =
+                    static_cast<DisplayCurrency>(j["displayCurrency"].get<int>());
             if (j.contains("textScale") && j["textScale"].is_number())
                 m_TextScale = j["textScale"].get<float>();
             if (j.contains("showGroundPrices") && j["showGroundPrices"].is_boolean())
                 m_ShowGroundPrices = j["showGroundPrices"].get<bool>();
             if (j.contains("showInventoryPrices") && j["showInventoryPrices"].is_boolean())
                 m_ShowInventoryPrices = j["showInventoryPrices"].get<bool>();
-            if (j.contains("showOtherInventoryPrices") && j["showOtherInventoryPrices"].is_boolean())
+            if (j.contains("showOtherInventoryPrices") &&
+                j["showOtherInventoryPrices"].is_boolean())
                 m_ShowOtherInventoryPrices = j["showOtherInventoryPrices"].get<bool>();
-            if (j.contains("refreshIntervalMin") && j["refreshIntervalMin"].is_number_integer())
+            if (j.contains("refreshIntervalMin") &&
+                j["refreshIntervalMin"].is_number_integer())
                 m_RefreshIntervalMin = std::clamp(j["refreshIntervalMin"].get<int>(), 15, 180);
             if (j.contains("hideWhenUnfocused") && j["hideWhenUnfocused"].is_boolean())
                 m_HideWhenUnfocused = j["hideWhenUnfocused"].get<bool>();
             if (j.contains("hideHotkey") && j["hideHotkey"].is_number_integer())
                 m_HideHotkey = j["hideHotkey"].get<int>();
             if (j.contains("uiPricePosition") && j["uiPricePosition"].is_number_integer())
-                m_UiPricePosition = static_cast<UiPricePosition>(j["uiPricePosition"].get<int>());
-            if (j.contains("groundPricePosition") && j["groundPricePosition"].is_number_integer())
-                m_GroundPricePosition = static_cast<GroundPricePosition>(j["groundPricePosition"].get<int>());
+                m_UiPricePosition =
+                    static_cast<UiPricePosition>(j["uiPricePosition"].get<int>());
+            if (j.contains("groundPricePosition") &&
+                j["groundPricePosition"].is_number_integer())
+                m_GroundPricePosition =
+                    static_cast<GroundPricePosition>(j["groundPricePosition"].get<int>());
 
-            // New format: currencyEnabled + uniqueEnabled
             if (j.contains("currencyEnabled") && j["currencyEnabled"].is_array()) {
                 auto& arr = j["currencyEnabled"];
                 for (int i = 0; i < kMaxCurrencyCategories && i < (int)arr.size(); i++) {
@@ -1158,14 +1032,12 @@ private:
                         m_CurrencyEnabled[i] = arr[i].get<bool>();
                 }
             }
-            // Backward compat: old format had "categoryEnabled" (13 bools)
             else if (j.contains("categoryEnabled") && j["categoryEnabled"].is_array()) {
                 auto& cats = j["categoryEnabled"];
                 for (int i = 0; i < 13 && i < (int)cats.size(); i++) {
                     if (cats[i].is_boolean())
                         m_CurrencyEnabled[i] = cats[i].get<bool>();
                 }
-                // Indices 13-15 default to true (already initialized)
             }
 
             if (j.contains("uniqueEnabled") && j["uniqueEnabled"].is_array()) {
@@ -1177,8 +1049,7 @@ private:
             }
         }
         catch (...) {
-            if (m_Context)
-                m_Context->Log("Warning", "[NinjaPricer] Failed to load settings, using defaults");
+            ctx()->Log.Warn("[NinjaPricer] Failed to load settings, using defaults");
         }
     }
 
@@ -1186,10 +1057,6 @@ private:
     // Members
     // ========================================================================
 
-    PluginContext* m_Context = nullptr;
-    std::string m_Directory;
-
-    // Settings
     std::string m_League = "Fate of the Vaal";
     DisplayCurrency m_DisplayCurrency = DisplayCurrency::Divine;
     float m_TextScale = 1.0f;
@@ -1198,10 +1065,10 @@ private:
     bool m_ShowOtherInventoryPrices = false;
     int m_RefreshIntervalMin = 15;
     bool m_HideWhenUnfocused = true;
-    int m_HideHotkey = 0;              // VK code, 0 = disabled
+    int m_HideHotkey = 0;
     UiPricePosition m_UiPricePosition = UiPricePosition::BottomRight;
     GroundPricePosition m_GroundPricePosition = GroundPricePosition::Top;
-    int m_DataSource = 1;  // 0 = poe.ninja, 1 = poe2scout
+    int m_DataSource = 1;
     bool m_CurrencyEnabled[kMaxCurrencyCategories] = {
         true, true, true, true, true, true, true, true,
         true, true, true, true, true, true, true
@@ -1214,7 +1081,7 @@ private:
     PriceDatabase m_PriceDb;
     std::shared_mutex m_DbMutex;
     std::atomic<bool> m_IsLoading{ false };
-    float m_CachedDivineInChaos = 1.0f; // Thread-local copy for rendering
+    float m_CachedDivineInChaos = 1.0f;
 
     // Price source instances
     NinjaSource m_NinjaSource;
@@ -1226,13 +1093,9 @@ private:
     std::atomic<bool> m_ForceRefresh{ false };
 
     // Runtime caches
-    std::unordered_map<uint32_t, std::string> m_NameCache; // entity ID -> item name
+    std::unordered_map<uint32_t, std::string> m_NameCache;
     uint64_t m_LastAreaChange = 0;
     std::chrono::steady_clock::time_point m_LastInventoryScan;
-
-    // Cached UI panel indices (brute-force discovered, reset on area change)
-    int m_InvRootIndex = -1;
-    int m_StashRootIndex = -1;
     std::chrono::steady_clock::time_point m_LastStashScan;
 
     // League cache
@@ -1244,13 +1107,13 @@ private:
 };
 
 // ============================================================================
-// Factory exports
+// v6 factory exports
 // ============================================================================
 
-extern "C" PLUGIN_API IPlugin* CreatePlugin() {
+extern "C" PLUGIN_API PluginSDK::Plugin* CreatePlugin() {
     return new NinjaPricerPlugin();
 }
 
-extern "C" PLUGIN_API void DestroyPlugin(IPlugin* plugin) {
+extern "C" PLUGIN_API void DestroyPlugin(PluginSDK::Plugin* plugin) {
     delete plugin;
 }
