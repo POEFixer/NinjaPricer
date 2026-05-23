@@ -535,6 +535,35 @@ struct ActiveSkill {
     int  TotalCooldownMs = 0;
     bool CanBeUsed = false;
 
+    // === append-only extensions (added 2026-05-23) ===
+    int  MaxUses = 0;                   // 0 if not cooldown-bound
+    int  TotalActiveCooldowns = 0;      // remaining charges = MaxUses - this (when MaxUses > 0)
+    uint32_t  EquipmentInfoPacked = 0;  // also decoded into Equipment below
+    uintptr_t GrantedEffectsPerLevelAddr = 0;
+    uintptr_t ActiveSkillsDatAddr = 0;
+    uintptr_t GrantedEffectStatSetsPerLevelAddr = 0;
+    uintptr_t SkillDetailsAddr = 0;     // pass to ctx->Memory.Read for further DAT fields
+
+    // Decoded equipment info. Bit layout mirrors GameHelper2's
+    // GameHelper/Utils/MiscHelper.cs `ActiveSkillGemDataParser` exactly.
+    struct EquipmentInfo {
+        uint32_t  GemNameHash = 0;       // packed >> 0x10              (upper 16 bits)
+        int       InventorySlot = 0;     // (low16 & 0x7F) + 1          (1-based InventoryName-ish)
+        int       LinkIndex = 0;         // (low16 >> 7) & 0x07
+        int       SocketIndex = 0;       // (low16 >> 10) & 0x07
+        int       UnknownFlag = 0;       // (low16 >> 13) & 0x03        ("something vaal related" per GameHelper2)
+        bool      CanBeOnPlayerItem = false; // (low16 >> 15) > 0       (residual bit after the above shifts)
+    } Equipment;
+
+    // NOTE on safe field access: ActiveSkillAbi is an append-only callback
+    // payload struct. We always read the full plan-version layout here
+    // because the plugin DLL and host build against the same checked-out
+    // PluginSDK.h / PluginAbi.h pair (PluginManager already verifies version
+    // and size_bytes >= sizeof(HostAbi) at attach time). For plugins built
+    // against an older PluginSDK.h, the older FromAbi simply reads fewer
+    // fields — that's fine because the host still writes the larger struct
+    // and the older code ignores the trailing bytes.
+
     static ActiveSkill FromAbi(const ActiveSkillAbi& a, const HostAbi* abi) {
         ActiveSkill s;
         s.CurrentSize     = a.current_size;
@@ -544,6 +573,30 @@ struct ActiveSkill {
         s.TotalCooldownMs = a.total_cooldown_ms;
         s.CanBeUsed       = a.can_be_used != 0;
         s.Name            = FetchString(a.name_addr, abi);
+
+        // Extensions
+        s.MaxUses                          = a.max_uses;
+        s.TotalActiveCooldowns             = a.total_active_cooldowns;
+        s.EquipmentInfoPacked              = a.equipment_info_packed;
+        s.GrantedEffectsPerLevelAddr       = a.granted_effects_per_level_addr;
+        s.ActiveSkillsDatAddr              = a.active_skills_dat_addr;
+        s.GrantedEffectStatSetsPerLevelAddr = a.granted_effect_stat_sets_per_level_addr;
+        s.SkillDetailsAddr                 = a.skill_details_addr;
+
+        // Decode packed equipment info (MiscHelper.cs:24-49 line-for-line).
+        uint32_t packed = a.equipment_info_packed;
+        s.Equipment.GemNameHash   = packed >> 0x10;
+        uint32_t low = packed & 0x0000FFFF;
+        s.Equipment.InventorySlot = static_cast<int>((low & 0x7F) + 1);
+        low >>= 7;
+        s.Equipment.LinkIndex     = static_cast<int>(low & 0x07);
+        low >>= 3;
+        s.Equipment.SocketIndex   = static_cast<int>(low & 0x07);
+        low >>= 3;
+        s.Equipment.UnknownFlag   = static_cast<int>(low & 0x03);
+        low >>= 2;
+        s.Equipment.CanBeOnPlayerItem = low > 0;
+
         return s;
     }
 };

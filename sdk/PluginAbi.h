@@ -290,13 +290,28 @@ typedef struct {
 } BuffsAbi;
 
 typedef struct {
+    // === existing v6 fields — DO NOT REORDER ===
     int32_t  current_size;
     int32_t  total_uses;
     int32_t  use_stage;
     int32_t  cast_type;
     int32_t  total_cooldown_ms;
-    int32_t  can_be_used;
+    int32_t  can_be_used;          // semantics fix lands with Bridge_Components.cpp rewrite
     uintptr_t name_addr;
+    // === ActiveSkillAbi APPEND-ONLY extensions (added 2026-05-23) ===
+    // SAFE because host allocates this struct and writes it; older plugin DLLs
+    // compiled against the pre-extension layout just read the first 7 fields
+    // and ignore the trailing bytes. Never reorder; never insert above this
+    // marker. New fields go below, before the END marker.
+    int32_t  max_uses;                                   // 0 if not cooldown-bound
+    int32_t  total_active_cooldowns;                     // currently-running CD slots
+    uint32_t equipment_info_packed;                      // raw skill.UnknownIdAndEquipmentInfo @0x10
+    int32_t  _pad;                                       // align to 8
+    uintptr_t granted_effects_per_level_addr;            // @0x18 of skill
+    uintptr_t active_skills_dat_addr;                    // @0x20 of skill
+    uintptr_t granted_effect_stat_sets_per_level_addr;   // @0x30 of skill
+    uintptr_t skill_details_addr;                        // raw 0x100-byte ActiveSkillDetails base
+    // === END ActiveSkillAbi extensions ===
 } ActiveSkillAbi;
 
 typedef struct {
