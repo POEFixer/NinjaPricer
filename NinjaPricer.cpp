@@ -1062,8 +1062,8 @@ private:
     float m_TextScale = 1.0f;
     bool m_ShowGroundPrices = true;
     bool m_ShowInventoryPrices = true;
-    bool m_ShowOtherInventoryPrices = false;
-    int m_RefreshIntervalMin = 15;
+    bool m_ShowOtherInventoryPrices = true;   // Show stash prices by default
+    int m_RefreshIntervalMin = 60;            // 60-min refresh - lighter on poe.ninja / poe2scout
     bool m_HideWhenUnfocused = true;
     int m_HideHotkey = 0;
     UiPricePosition m_UiPricePosition = UiPricePosition::BottomRight;
