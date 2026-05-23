@@ -660,6 +660,22 @@ typedef struct HostAbi {
     EventsServiceAbi      events;
     void*                 imgui_context;
     void*                 d3d_device;
+
+    // === v6 EXTENSIONS — APPEND ONLY ===
+    // New fields MUST be appended below this marker. Inserting between
+    // existing HostAbi fields (above) shifts offsets and breaks binary
+    // compatibility for every plugin DLL already built against the
+    // current layout. To add new functionality without a version bump,
+    // append at the END of HostAbi, never in the middle.
+
+    // Resolve a WorldItem container entity into its inner item entity and
+    // populate both ABI structs from a fresh memory read. Returns 1 on
+    // success, 0 if `container_addr` is not a WorldItem container, the
+    // inner item is not yet resolved (mid-spawn), or any read fails.
+    int32_t (*get_world_item_inner)(uintptr_t container_addr,
+                                    EntityInfoAbi* out_e,
+                                    ComponentAddressesAbi* out_c);
+    // === END v6 EXTENSIONS ===
 } HostAbi;
 
 #ifdef __cplusplus

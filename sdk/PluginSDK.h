@@ -1095,6 +1095,25 @@ public:
         if (!m_abi->get_watched_components(id, &raw)) return std::nullopt;
         return ComponentAddresses::FromAbi(raw);
     }
+
+    // Resolve a WorldItem container entity into its inner item entity.
+    // Returns std::nullopt if the address is not a WorldItem container,
+    // the inner item is not yet resolved, or any read fails.
+    // The returned Entity has its Components field populated with the
+    // inner item's component addresses (Mods, Base, Stack, Sockets, ...).
+    //
+    // NOTE: this routes through m_host (HostAbi top-level pointer), not
+    // m_abi (EntitiesServiceAbi), so we can grow the SDK surface without
+    // shifting any inner-service-struct offsets — preserves v6 ABI compat.
+    std::optional<Entity> GetWorldItemInner(uintptr_t containerAddr) const {
+        if (!m_host || !m_host->get_world_item_inner || containerAddr == 0)
+            return std::nullopt;
+        EntityInfoAbi e{};
+        ComponentAddressesAbi c{};
+        if (!m_host->get_world_item_inner(containerAddr, &e, &c))
+            return std::nullopt;
+        return Entity::FromAbi(e, c, m_host);
+    }
 };
 
 class ComponentsService {
@@ -1962,7 +1981,15 @@ private:
 
 // Lives inside the plugin DLL; the host loader resolves it via GetProcAddress
 // and calls it between CreatePlugin() and OnEnable(). Rejects mismatched
-// version or struct size, leaving HostCompatible() false.
+// version, leaving HostCompatible() false.
+//
+// Size compatibility is one-way: the host may grow `sizeof(HostAbi)` by
+// appending fields (no version bump) as long as existing fields keep their
+// offsets. A plugin compiled against an older (smaller) `sizeof(HostAbi)`
+// therefore accepts a larger host struct because the host's layout is a
+// superset of what the plugin reads. We only reject hosts whose struct is
+// *smaller* than what this plugin was built against — that would mean the
+// host is missing fields the plugin may dereference.
 inline void PluginSDK_AttachHost(PluginSDK::Plugin* p,
                                  const HostAbi*  abi,
                                  const char*        directory) {
@@ -1971,7 +1998,7 @@ inline void PluginSDK_AttachHost(PluginSDK::Plugin* p,
     p->m_host_compatible =
         (abi != nullptr
          && abi->version == PLUGIN_SDK_VERSION
-         && abi->size_bytes == sizeof(HostAbi));
+         && abi->size_bytes >= sizeof(HostAbi));  // append-only growth allowed
     if (!p->m_host_compatible) return;
 
     p->m_ctx.Game      .Init(&abi->game,       abi);
