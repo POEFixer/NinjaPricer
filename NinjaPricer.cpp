@@ -250,8 +250,15 @@ public:
         ImGui::Spacing();
 
         ImGui::Checkbox("Show prices on dropped items", &m_ShowGroundPrices);
+
         ImGui::Checkbox("Show prices in inventory", &m_ShowInventoryPrices);
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f), "(may affect FPS)");
+
         ImGui::Checkbox("Show prices in stash", &m_ShowOtherInventoryPrices);
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f), "(may affect FPS)");
+
         ImGui::Checkbox("Hide when game not focused", &m_HideWhenUnfocused);
 
         ImGui::Separator();
@@ -343,15 +350,10 @@ public:
 
         if (snap.AreaChangeCounter != m_LastAreaChange) {
             m_NameCache.clear();
+            m_CachedInventories.clear();
+            m_RarityCache.clear();
+            m_LastInventoryScan = {};   // force immediate refresh in new area
             m_LastAreaChange = snap.AreaChangeCounter;
-        }
-
-        if (m_ShowInventoryPrices || m_ShowOtherInventoryPrices) {
-            auto now = std::chrono::steady_clock::now();
-            if (now - m_LastInventoryScan > std::chrono::seconds(1)) {
-                ctx()->Inventory.Scan(-1);
-                m_LastInventoryScan = now;
-            }
         }
 
         std::shared_lock<std::shared_mutex> lock(m_DbMutex);
@@ -363,24 +365,18 @@ public:
             DrawGroundItemPrices(snap);
         }
 
-        // v6: FindPanelByStringId replaces the v5 brute-force scan over
-        // child indices 25-35.
-        uintptr_t gameUiRoot = ctx()->Ui.GetGameUiRoot();
-        uintptr_t inventoryPanel = 0;
-        uintptr_t stashPanel = 0;
-        if (gameUiRoot != 0) {
-            inventoryPanel = ctx()->Ui.FindPanelByStringId(gameUiRoot, "Inventory");
-            stashPanel = ctx()->Ui.FindPanelByStringId(gameUiRoot, "Stash");
-        }
-
-        if (m_ShowInventoryPrices && inventoryPanel != 0
-            && ctx()->Ui.IsVisible(inventoryPanel)) {
-            DrawInventoryPrices();
-        }
-
-        if (m_ShowOtherInventoryPrices && stashPanel != 0
-            && ctx()->Ui.IsVisible(stashPanel)) {
-            DrawStashPrices(stashPanel);
+        if (m_ShowInventoryPrices || m_ShowOtherInventoryPrices) {
+            auto now = std::chrono::steady_clock::now();
+            if (now - m_LastInventoryScan > std::chrono::seconds(1)) {
+                ctx()->Inventory.Scan(-1);
+                // Single GetAll() per scan tick — without this cache, every
+                // frame at 60 FPS pays the full ABI cost: bridge enumerate
+                // + per-inventory enumerate_items + 3× FetchString per item.
+                m_CachedInventories = ctx()->Inventory.GetAll();
+                m_RarityCache.clear();
+                m_LastInventoryScan = now;
+            }
+            DrawInventoryOverlays();
         }
     }
 
@@ -484,7 +480,7 @@ private:
                     || e.EntitySubtype != PluginSDK::EntitySubtype::WorldItem) continue;
                 if (count++ >= 5) break;
 
-                std::string name = GetEntityLookupName(e);
+                std::string name = GetGroundLookupName(e);
                 if (name.empty()) name = "(not read yet)";
 
                 std::shared_lock<std::shared_mutex> lock(m_DbMutex);
@@ -570,81 +566,80 @@ private:
     }
 
     // ========================================================================
-    // Ground Item Prices (via UI tree: GameUi[7][0][0] and [7][0][1])
+    // Ground Item Prices (entity-based; mirrors ExamplePlugin's
+    // ComponentReader.h "Items on Ground" pattern). Name + stack come from
+    // the WorldItem entity / its inner item; position comes from
+    // WorldToScreen on the entity's world coordinates.
     // ========================================================================
 
-    void DrawGroundItemPrices(const PluginSDK::Snapshot& /*snap*/) {
-        uintptr_t gameUiAddr = ctx()->Ui.GetGameUiRoot();
-        if (gameUiAddr == 0) return;
-
+    void DrawGroundItemPrices(const PluginSDK::Snapshot& snap) {
         ImDrawList* dl = ImGui::GetForegroundDrawList();
         float baseFontSize = ImGui::GetFontSize() * m_TextScale;
+        float baseRefSize = ImGui::GetFontSize();
+        if (baseRefSize <= 0.f) return;
 
-        const int containerIndices[] = { 7, 0 };
-        uintptr_t containerBase = ctx()->Ui.FollowPath(gameUiAddr, containerIndices, 2);
-        if (containerBase == 0) return;
+        for (const auto& e : snap.Entities) {
+            if (e.EntityType != PluginSDK::EntityType::Item) continue;
 
-        // Both containers: [0]=normal, [1]=hovered
-        for (int ci = 0; ci < 2; ci++) {
-            uintptr_t containerAddr = ctx()->Ui.GetChildAt(containerBase, ci);
-            if (containerAddr == 0) continue;
+            std::string name = GetGroundLookupName(e);
+            if (name.empty()) continue;
 
-            auto children = ctx()->Ui.GetChildren(containerAddr);
-            for (uintptr_t childAddr : children) {
-                if (childAddr == 0) continue;
-                if (!ctx()->Ui.IsVisible(childAddr)) continue;
+            PriceLookupResult price = LookupPrice(m_PriceDb, name);
+            if (!price.found) continue;
 
-                PluginSDK::UiElement elemData = ctx()->Ui.Read(childAddr);
-                if (elemData.ElementType != 0x4084) continue;
+            // Resolve the inner item once; reused for both unique-rarity gate
+            // and stack multiplier so we never call GetWorldItemInner twice.
+            auto inner = ctx()->Entities.GetWorldItemInner(e.Address);
 
-                std::string itemName = ctx()->Ui.GetStringId(childAddr);
-                if (itemName.empty()) continue;
-
-                int stackMultiplier = 1;
-                std::string lookupName = ParseGroundItemName(itemName, stackMultiplier);
-                if (lookupName.empty()) continue;
-
-                PriceLookupResult price = LookupPrice(m_PriceDb, lookupName);
-                if (!price.found) continue;
-
-                if (IsUniqueCategory(price.category)) {
-                    std::string lowerLookup = ToLower(lookupName);
-                    std::string lowerUnique = ToLower(price.itemName);
-                    if (lowerLookup.find(lowerUnique) == std::string::npos)
-                        continue;
-                }
-
-                float displayValue = GetDisplayValue(price, m_DisplayCurrency) * stackMultiplier;
-                if (displayValue < 0.001f) continue;
-
-                float posX, posY, sizeW, sizeH;
-                if (!ctx()->Ui.ComputeScreenRect(childAddr, posX, posY, sizeW, sizeH))
-                    continue;
-                if (sizeW < 1.0f) continue;
-
-                std::string text = FormatPrice(displayValue, m_DisplayCurrency);
-                ImVec2 ts = ImGui::CalcTextSize(text.c_str());
-                float sw = ts.x * (baseFontSize / ImGui::GetFontSize());
-                float sh = ts.y * (baseFontSize / ImGui::GetFontSize());
-
-                float textX, textY;
-                CalcGroundPricePos(posX, posY, sizeW, sizeH, sw, sh, baseFontSize, textX, textY);
-
-                DrawPriceLabelAt(dl, baseFontSize, textX, textY, sw, sh, text,
-                                 price.chaosValue * stackMultiplier);
+            // Unique-category guard: LookupPrice can land on a unique entry
+            // via its contains-match path (e.g. base-type "Heavy Belt" hitting
+            // "Headhunter"). Require the actual entity to have Rarity == 3
+            // (Unique) before showing a unique price.
+            if (IsUniqueCategory(price.category)) {
+                if (!inner || !inner->Components.HasMods()) continue;
+                auto mods = ctx()->Components.ReadMods(inner->Components.Mods);
+                if (!mods.Valid || mods.Rarity != 3) continue;
             }
+
+            int stackMultiplier = 1;
+            if (inner && inner->Components.HasStack()) {
+                int sc = ctx()->Components.GetStackCount(inner->Components.Stack);
+                if (sc > 1) stackMultiplier = sc;
+            }
+
+            float displayValue =
+                GetDisplayValue(price, m_DisplayCurrency) * stackMultiplier;
+            if (displayValue < 0.001f) continue;
+
+            float sx, sy;
+            if (!ctx()->Render.WorldToScreen(e.WorldX, e.WorldY, e.WorldZ, sx, sy))
+                continue;
+
+            std::string text = FormatPrice(displayValue, m_DisplayCurrency);
+            ImVec2 ts = ImGui::CalcTextSize(text.c_str());
+            float sw = ts.x * (baseFontSize / baseRefSize);
+            float sh = ts.y * (baseFontSize / baseRefSize);
+
+            // Anchor is a single screen point (zero-sized box). CalcGroundPricePos
+            // already centres text around (sx, sy) with the four presets.
+            float textX, textY;
+            CalcGroundPricePos(sx, sy, /*labelW=*/0.0f, /*labelH=*/0.0f,
+                               sw, sh, baseFontSize, textX, textY);
+
+            DrawPriceLabelAt(dl, baseFontSize, textX, textY, sw, sh, text,
+                             price.chaosValue * stackMultiplier);
         }
     }
 
     // ========================================================================
-    // Inventory Prices — uses InventoryService::Get(1) for main inventory
+    // Inventory / Stash Overlays — Grid.Valid-gated. Iterates every inventory
+    // returned by InventoryService.GetAll() and draws prices on each one whose
+    // host-populated Grid is valid (host sets Grid.Valid only when the panel
+    // UI is open). No UI-tree identification — robust against locale, panel
+    // reorganization, and StringId changes.
     // ========================================================================
 
-    void DrawInventoryPrices() {
-        PluginSDK::Inventory inv = ctx()->Inventory.Get(1);  // main inventory
-        if (inv.InventoryId != 1) return;
-        if (!inv.Grid.Valid || inv.Grid.CellSize < 1.0f) return;
-
+    void DrawInventoryGrid(const PluginSDK::Inventory& inv) {
         ImDrawList* dl = ImGui::GetForegroundDrawList();
         float baseFontSize = ImGui::GetFontSize() * m_TextScale;
 
@@ -656,7 +651,18 @@ private:
             if (!price.found) continue;
 
             if (IsUniqueCategory(price.category) && item.Address) {
-                if (ctx()->Inventory.ReadItemRarity(item.Address) != 3)
+                // Cache rarity per item address to avoid the bridge round-
+                // trip + RPM on every frame. m_RarityCache is cleared on
+                // every Scan tick (and on area change) for freshness.
+                int rarity;
+                auto it = m_RarityCache.find(item.Address);
+                if (it != m_RarityCache.end()) {
+                    rarity = it->second;
+                } else {
+                    rarity = ctx()->Inventory.ReadItemRarity(item.Address);
+                    m_RarityCache[item.Address] = rarity;
+                }
+                if (rarity != 3)
                     continue;
             }
 
@@ -685,90 +691,17 @@ private:
         }
     }
 
-    // ========================================================================
-    // Stash Prices — inventory-data-driven, position-based rendering
-    // ========================================================================
+    void DrawInventoryOverlays() {
+        // Iterates the cached inventory vector (refreshed by DrawUI once per
+        // Scan tick) rather than calling GetAll() per frame.
+        for (const auto& inv : m_CachedInventories) {
+            if (!inv.Grid.Valid || inv.Grid.CellSize < 1.0f) continue;
 
-    void DrawStashPrices(uintptr_t stashRoot) {
-        if (stashRoot == 0) return;
+            const bool isPlayer = (inv.InventoryId == 1);
+            if (isPlayer  && !m_ShowInventoryPrices)      continue;
+            if (!isPlayer && !m_ShowOtherInventoryPrices) continue;
 
-        // Navigate: root→2→0→0→0→1→1 → tab list
-        const int tabListIndices[] = { 2, 0, 0, 0, 1, 1 };
-        uintptr_t tabList = ctx()->Ui.FollowPath(stashRoot, tabListIndices, 6);
-        if (tabList == 0) return;
-
-        auto tabs = ctx()->Ui.GetChildren(tabList);
-        int activeTabIdx = -1;
-        for (int i = 0; i < (int)tabs.size(); i++) {
-            if (tabs[i] != 0 && ctx()->Ui.IsVisible(tabs[i])) {
-                activeTabIdx = i;
-                break;
-            }
-        }
-        if (activeTabIdx < 0) return;
-
-        auto now = std::chrono::steady_clock::now();
-        if (now - m_LastStashScan > std::chrono::seconds(1)) {
-            ctx()->Inventory.Scan(-1);
-            m_LastStashScan = now;
-        }
-
-        int stashInvId = 133 + activeTabIdx;
-        PluginSDK::Inventory stashInv = ctx()->Inventory.Get(stashInvId);
-        if (stashInv.Items.empty()) return;
-        if (stashInv.TotalBoxesX <= 0 || stashInv.TotalBoxesY <= 0) return;
-
-        uintptr_t activeTabAddr = tabs[activeTabIdx];
-        const int itemContainerIndices[] = { 0, 0 };
-        uintptr_t itemContainer = ctx()->Ui.FollowPath(activeTabAddr, itemContainerIndices, 2);
-        if (itemContainer == 0) return;
-
-        float containerX, containerY, containerW, containerH;
-        if (!ctx()->Ui.ComputeScreenRect(itemContainer,
-                                          containerX, containerY, containerW, containerH))
-            return;
-        if (containerW < 1.0f || containerH < 1.0f) return;
-
-        float cellW = containerW / static_cast<float>(stashInv.TotalBoxesX);
-        float cellH = containerH / static_cast<float>(stashInv.TotalBoxesY);
-
-        ImDrawList* dl = ImGui::GetForegroundDrawList();
-        float baseFontSize = ImGui::GetFontSize() * m_TextScale;
-
-        for (const auto& item : stashInv.Items) {
-            std::string dn = GetItemLookupName(item);
-            if (dn.empty()) continue;
-
-            PriceLookupResult price = LookupPrice(m_PriceDb, dn);
-            if (!price.found) continue;
-
-            if (IsUniqueCategory(price.category) && item.Address) {
-                if (ctx()->Inventory.ReadItemRarity(item.Address) != 3)
-                    continue;
-            }
-
-            int multiplier = (item.StackCount > 1) ? item.StackCount : 1;
-            float displayValue = GetDisplayValue(price, m_DisplayCurrency) * multiplier;
-            if (displayValue < 0.001f) continue;
-
-            std::string text = FormatPrice(displayValue, m_DisplayCurrency);
-
-            float posX = containerX + item.SlotX * cellW;
-            float posY = containerY + item.SlotY * cellH;
-            float itemW = item.Width * cellW;
-            float itemH = item.Height * cellH;
-
-            float fontSize = ComputeAdaptiveFontSize(baseFontSize, itemW, itemH);
-
-            ImVec2 ts = ImGui::CalcTextSize(text.c_str());
-            float sw = ts.x * (fontSize / ImGui::GetFontSize());
-            float sh = ts.y * (fontSize / ImGui::GetFontSize());
-
-            float labelX, labelY;
-            CalcUiPricePos(posX, posY, itemW, itemH, sw, sh, 2.0f, labelX, labelY);
-
-            DrawPriceLabelAt(dl, fontSize, labelX, labelY, sw, sh, text,
-                             price.chaosValue * multiplier);
+            DrawInventoryGrid(inv);
         }
     }
 
@@ -876,30 +809,6 @@ private:
     // Item-name helpers
     // ========================================================================
 
-    static std::string ParseGroundItemName(const std::string& raw, int& outMultiplier) {
-        outMultiplier = 1;
-        if (raw.size() < 3) return raw;
-
-        size_t i = 0;
-        while (i < raw.size() && raw[i] >= '0' && raw[i] <= '9') i++;
-        if (i > 0 && i < raw.size() && raw[i] == 'x'
-            && i + 1 < raw.size() && raw[i + 1] == ' ') {
-            outMultiplier = std::atoi(raw.c_str());
-            if (outMultiplier < 1) outMultiplier = 1;
-            return raw.substr(i + 2);
-        }
-        return raw;
-    }
-
-    std::string GetItemBaseTypeName(const PluginSDK::Entity& entity) {
-        auto it = m_NameCache.find(entity.Id);
-        if (it != m_NameCache.end()) return it->second;
-
-        std::string name = ctx()->Inventory.ReadItemBaseTypeName(entity.Address);
-        m_NameCache[entity.Id] = name;
-        return name;
-    }
-
     std::string GetItemLookupName(const PluginSDK::InventoryItem& item) {
         if (!item.UniqueName.empty())
             return item.UniqueName;
@@ -914,10 +823,21 @@ private:
         return "";
     }
 
-    std::string GetEntityLookupName(const PluginSDK::Entity& entity) {
+    // Lookup name for a WorldItem entity on the ground. UniqueName preferred,
+    // BaseTypeName as fallback. Both calls auto-resolve WorldItem containers
+    // (see PluginSDK.h:1493-1511). Only non-empty results are cached, so an
+    // entity whose name has not streamed in yet retries next frame.
+    std::string GetGroundLookupName(const PluginSDK::Entity& entity) {
+        auto it = m_NameCache.find(entity.Id);
+        if (it != m_NameCache.end()) return it->second;
+
         std::string un = ctx()->Inventory.ReadItemUniqueName(entity.Address);
-        if (!un.empty()) return un;
-        return GetItemBaseTypeName(entity);
+        std::string name = !un.empty()
+            ? un
+            : ctx()->Inventory.ReadItemBaseTypeName(entity.Address);
+        if (!name.empty())
+            m_NameCache[entity.Id] = name;
+        return name;
     }
 
     // ========================================================================
@@ -1061,8 +981,8 @@ private:
     DisplayCurrency m_DisplayCurrency = DisplayCurrency::Divine;
     float m_TextScale = 1.0f;
     bool m_ShowGroundPrices = true;
-    bool m_ShowInventoryPrices = true;
-    bool m_ShowOtherInventoryPrices = true;   // Show stash prices by default
+    bool m_ShowInventoryPrices = false;       // Off by default — minor frame-time impact
+    bool m_ShowOtherInventoryPrices = false;  // Off by default — minor frame-time impact
     int m_RefreshIntervalMin = 60;            // 60-min refresh - lighter on poe.ninja / poe2scout
     bool m_HideWhenUnfocused = true;
     int m_HideHotkey = 0;
@@ -1096,7 +1016,15 @@ private:
     std::unordered_map<uint32_t, std::string> m_NameCache;
     uint64_t m_LastAreaChange = 0;
     std::chrono::steady_clock::time_point m_LastInventoryScan;
-    std::chrono::steady_clock::time_point m_LastStashScan;
+
+    // Inventory data cache — refreshed once per Scan tick (1 Hz). Avoids
+    // 60-FPS bridge round-trips through Inventory.GetAll() + per-item
+    // FetchString. Cleared on area change and on every scan refresh.
+    std::vector<PluginSDK::Inventory> m_CachedInventories;
+
+    // Per-item rarity cache for the unique-category gate. Keyed by
+    // InventoryItem::Address, cleared alongside m_CachedInventories.
+    std::unordered_map<uintptr_t, int> m_RarityCache;
 
     // League cache
     std::vector<std::string> m_Leagues;
