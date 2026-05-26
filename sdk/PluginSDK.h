@@ -130,6 +130,7 @@ class MemoryService;
 class LogService;
 class EventsService;
 class OverlayService;
+class FlasksService;
 class Plugin;
 struct Context;
 
@@ -810,6 +811,78 @@ struct InventoryItem {
         i.BaseTypeName     = FetchString(a.base_type_name_addr, abi);
         i.UniqueName       = FetchString(a.unique_name_addr, abi);
         return i;
+    }
+};
+
+struct Flask {
+    uintptr_t   EntityAddress = 0;
+    int32_t     SlotIndex = -1;
+    int32_t     ChargesCurrent = 0;
+    int32_t     PerUseBase = 0;
+    int32_t     PerUseEffective = 0;
+    bool        Usable = false;
+    bool        Active = false;
+    bool        IsLife = false;
+    bool        IsMana = false;
+    int32_t     SlotX = 0;
+    int32_t     SlotY = 0;
+    int32_t     ModCount = 0;
+    std::string Name;
+    std::string BaseType;
+    std::string Path;
+    bool        Valid = false;
+
+    static Flask FromAbi(const FlaskAbi& a, const HostAbi* abi) {
+        Flask f;
+        f.EntityAddress    = a.entity_address;
+        f.SlotIndex        = a.slot_index;
+        f.ChargesCurrent   = a.charges_current;
+        f.PerUseBase       = a.per_use_base;
+        f.PerUseEffective  = a.per_use_effective;
+        f.Usable           = a.usable != 0;
+        f.Active           = a.active != 0;
+        f.IsLife           = a.is_life != 0;
+        f.IsMana           = a.is_mana != 0;
+        f.SlotX            = a.slot_x;
+        f.SlotY            = a.slot_y;
+        f.ModCount         = a.mod_count;
+        f.Valid            = a.valid != 0;
+        f.Name             = FetchString(a.name_addr, abi);
+        f.BaseType         = FetchString(a.base_type_addr, abi);
+        f.Path             = FetchString(a.path_addr, abi);
+        return f;
+    }
+};
+
+struct Charm {
+    uintptr_t   EntityAddress = 0;
+    int32_t     SlotIndex = -1;
+    int32_t     ChargesCurrent = 0;
+    int32_t     PerUseBase = 0;
+    bool        Active = false;
+    int32_t     SlotX = 0;
+    int32_t     SlotY = 0;
+    int32_t     ModCount = 0;
+    std::string Name;
+    std::string BaseType;
+    std::string Path;
+    bool        Valid = false;
+
+    static Charm FromAbi(const CharmAbi& a, const HostAbi* abi) {
+        Charm c;
+        c.EntityAddress    = a.entity_address;
+        c.SlotIndex        = a.slot_index;
+        c.ChargesCurrent   = a.charges_current;
+        c.PerUseBase       = a.per_use_base;
+        c.Active           = a.active != 0;
+        c.SlotX            = a.slot_x;
+        c.SlotY            = a.slot_y;
+        c.ModCount         = a.mod_count;
+        c.Valid            = a.valid != 0;
+        c.Name             = FetchString(a.name_addr, abi);
+        c.BaseType         = FetchString(a.base_type_addr, abi);
+        c.Path             = FetchString(a.path_addr, abi);
+        return c;
     }
 };
 
@@ -2151,6 +2224,69 @@ public:
     }
 };
 
+class FlasksService {
+    const FlasksServiceAbi* m_abi = nullptr;
+    const HostAbi*          m_host = nullptr;
+public:
+    void Init(const FlasksServiceAbi* abi, const HostAbi* host) {
+        m_abi  = abi;
+        m_host = host;
+    }
+
+    // GetFlask/GetCharm: returns nullopt on out-of-range or not-in-game.
+    // Empty slot returns Flask{ Valid=false, ... } (still a Flask wrapper).
+    std::optional<Flask> GetFlask(int32_t slot) const {
+        if (!m_abi || !m_abi->get_flask) return std::nullopt;
+        FlaskAbi a{};
+        if (!m_abi->get_flask(slot, &a)) return std::nullopt;
+        return Flask::FromAbi(a, m_host);
+    }
+
+    std::optional<Charm> GetCharm(int32_t slot) const {
+        if (!m_abi || !m_abi->get_charm) return std::nullopt;
+        CharmAbi a{};
+        if (!m_abi->get_charm(slot, &a)) return std::nullopt;
+        return Charm::FromAbi(a, m_host);
+    }
+
+    std::vector<Flask> AllFlasks() const {
+        std::vector<Flask> out;
+        if (!m_abi || !m_abi->enumerate_flasks) return out;
+        struct Ctx { std::vector<Flask>* out; const HostAbi* host; };
+        Ctx c{ &out, m_host };
+        m_abi->enumerate_flasks(
+            [](const FlaskAbi* a, void* ud) -> int32_t {
+                auto* p = static_cast<Ctx*>(ud);
+                p->out->push_back(Flask::FromAbi(*a, p->host));
+                return 1;
+            },
+            &c);
+        return out;
+    }
+
+    std::vector<Charm> AllCharms() const {
+        std::vector<Charm> out;
+        if (!m_abi || !m_abi->enumerate_charms) return out;
+        struct Ctx { std::vector<Charm>* out; const HostAbi* host; };
+        Ctx c{ &out, m_host };
+        m_abi->enumerate_charms(
+            [](const CharmAbi* a, void* ud) -> int32_t {
+                auto* p = static_cast<Ctx*>(ud);
+                p->out->push_back(Charm::FromAbi(*a, p->host));
+                return 1;
+            },
+            &c);
+        return out;
+    }
+
+    int32_t FlaskSlotCount() const {
+        return (m_abi && m_abi->flask_slot_count) ? m_abi->flask_slot_count() : 0;
+    }
+    int32_t CharmSlotCount() const {
+        return (m_abi && m_abi->charm_slot_count) ? m_abi->charm_slot_count() : 0;
+    }
+};
+
 struct Context {
     GameService       Game;
     EntitiesService   Entities;
@@ -2163,6 +2299,7 @@ struct Context {
     LogService        Log;
     EventsService     Events;
     OverlayService    Overlay;
+    FlasksService     Flasks;
     void* ImGuiContext = nullptr;
     void* D3DDevice    = nullptr;
 };
@@ -2286,6 +2423,7 @@ inline void PluginSDK_AttachHost(PluginSDK::Plugin* p,
     p->m_ctx.Log       .Init(&abi->log,        abi);
     p->m_ctx.Events    .Init(&abi->events,     abi);
     p->m_ctx.Overlay   .Init(&abi->overlay,    abi, p);   // p = plugin_token
+    p->m_ctx.Flasks    .Init(&abi->flasks,     abi);
     p->m_ctx.ImGuiContext = abi->imgui_context;
     p->m_ctx.D3DDevice    = abi->d3d_device;
 }

@@ -435,6 +435,40 @@ typedef struct {
 } InventoryItemAbi;
 
 typedef struct {
+    int32_t   valid;                // 0 = slot empty / not in game; 1 = filled
+    uintptr_t entity_address;       // for ReadCharges/EnumerateItemMods follow-ups
+    int32_t   slot_index;           // 0..1; canonical: 0=life, 1=mana
+    int32_t   charges_current;
+    int32_t   per_use_base;         // raw from Charges component
+    int32_t   per_use_effective;    // base * (100 + sum_mods%) / 100  [stats% deferred]
+    int32_t   usable;               // bool
+    int32_t   active;               // bool, from Buffs.FlaskActive
+    int32_t   is_life;              // bool
+    int32_t   is_mana;              // bool
+    int32_t   slot_x;
+    int32_t   slot_y;
+    int32_t   mod_count;            // hint; full list via Components / Inventory API
+    uintptr_t name_addr;            // host-owned; pass to read_string
+    uintptr_t base_type_addr;       // host-owned
+    uintptr_t path_addr;            // host-owned
+} FlaskAbi;
+
+typedef struct {
+    int32_t   valid;
+    uintptr_t entity_address;
+    int32_t   slot_index;           // 0..2
+    int32_t   charges_current;      // 0 if no Charges component
+    int32_t   per_use_base;         // 0 if no Charges component
+    int32_t   active;               // bool, from Buffs.FlaskActive[2..4]
+    int32_t   slot_x;
+    int32_t   slot_y;
+    int32_t   mod_count;
+    uintptr_t name_addr;
+    uintptr_t base_type_addr;
+    uintptr_t path_addr;
+} CharmAbi;
+
+typedef struct {
     int32_t   inventory_id;
     int32_t   total_boxes_x;
     int32_t   total_boxes_y;
@@ -515,6 +549,8 @@ typedef int32_t (*PsdkBuffVisitorFn)(const BuffAbi* buff, void* userdata);
 typedef int32_t (*PsdkActiveSkillVisitorFn)(const ActiveSkillAbi* s, void* userdata);
 typedef int32_t (*PsdkStatVisitorFn)(int32_t key, int32_t value, PsdkStatSource source_kind, void* userdata);
 typedef int32_t (*PsdkTgtVisitorFn)(const TgtLocationAbi* loc, void* userdata);
+typedef int32_t (*PsdkFlaskVisitorFn)(const FlaskAbi* item, void* userdata);
+typedef int32_t (*PsdkCharmVisitorFn)(const CharmAbi* item, void* userdata);
 typedef int32_t (*PsdkUiChildVisitorFn)(uintptr_t child_addr, int32_t index, void* userdata);
 typedef void    (*PsdkEventCallbackFn)(void* userdata);
 
@@ -694,6 +730,29 @@ typedef struct {
     void (*set_wants_overlay_input)(void* plugin_token, int32_t enable);
 } OverlayServiceAbi;
 
+// =============================================================================
+// FlasksServiceAbi (v6 EXTENSION — APPEND-ONLY, added 2026-05-26)
+//
+// First-class access to the utility belt (Inventory[12]): 2 flasks (life/mana)
+// and 3 charms in canonical slot order. Data is precomputed by the host's
+// worker thread each tick from `Inventories[12]` items + player Buffs/Stats.
+// Empty slots return Valid=false. See PluginSDK.h for the C++ wrapper.
+// =============================================================================
+typedef struct {
+    // Returns 1 on success (out filled — possibly with valid=0 for empty slot),
+    //         0 on out-of-range, not in game, or null out.
+    int32_t (*get_flask)(int32_t slot, FlaskAbi* out);
+    int32_t (*get_charm)(int32_t slot, CharmAbi* out);
+
+    // Iterate ALL slots including empty ones (valid=0). Return 0 from cb to stop.
+    void (*enumerate_flasks)(PsdkFlaskVisitorFn cb, void* userdata);
+    void (*enumerate_charms)(PsdkCharmVisitorFn cb, void* userdata);
+
+    // POE2 today returns 2/3. Future-proof in case GGG changes the belt.
+    int32_t (*flask_slot_count)(void);
+    int32_t (*charm_slot_count)(void);
+} FlasksServiceAbi;
+
 typedef struct HostAbi {
     uint32_t              version;     // = PLUGIN_SDK_VERSION (6)
     uint32_t              size_bytes;  // = sizeof(HostAbi)
@@ -729,6 +788,10 @@ typedef struct HostAbi {
     // Added 2026-05-26. See OverlayServiceAbi declaration above for
     // full documentation.
     OverlayServiceAbi overlay;
+
+    // FlasksServiceAbi — flask/charm convenience data for plugins.
+    // Added 2026-05-26. See FlasksServiceAbi declaration above for details.
+    FlasksServiceAbi flasks;
     // === END v6 EXTENSIONS ===
 } HostAbi;
 
