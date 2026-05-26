@@ -660,6 +660,40 @@ typedef struct {
     void     (*unsubscribe)(uint64_t token);
 } EventsServiceAbi;
 
+// =============================================================================
+// OverlayServiceAbi (v6 EXTENSION — APPEND-ONLY, added 2026-05-26)
+//
+// Per-plugin "request flags" that influence host-side aggregate state.
+// `plugin_token` is the plugin's `this` pointer (or any stable per-instance
+// pointer); the host uses it to track which plugin made which request and
+// auto-clears all of a plugin's flags on Disable/Unload. Multiple plugins'
+// flags + the host's built-in needs are OR-aggregated.
+//
+// Safe from any thread. Bridge is SEH-wrapped and tolerant of NULL token.
+//
+// Full per-function documentation: see `OverlayService` in PluginSDK.h.
+// =============================================================================
+typedef struct {
+    // Opt this plugin into receiving entities with EntityState Useless
+    // (a.k.a. "sleeping" in host terminology) in EntitiesService::enumerate.
+    // NOTE: distinct from the per-entity EntityInfoAbi::is_sleeping flag,
+    // which specifically marks entities that came from the host's separate
+    // SleepingEntities collection. This gate is the broader Useless filter
+    // plus the SleepingEntities-collection inclusion in one toggle, matching
+    // the host's GameClient::SetIncludeSleepingEntities semantics.
+    // Off by default (saves ~5-15% CPU/frame). Use for map-pickers and
+    // debug tools that need the full entity pool.
+    void (*set_include_sleeping_entities)(void* plugin_token, int32_t enable);
+
+    // Request that the overlay window receives mouse clicks instead of
+    // passing them through to the game (i.e., temporarily disable
+    // WS_EX_TRANSPARENT while cursor is over your ImGui windows). Use when
+    // your plugin opens a popup or implements a map-picker flow. Keyboard is
+    // unaffected. See PluginSDK.h for nuances about background draw lists
+    // and InvisibleButton-based hit-testing.
+    void (*set_wants_overlay_input)(void* plugin_token, int32_t enable);
+} OverlayServiceAbi;
+
 typedef struct HostAbi {
     uint32_t              version;     // = PLUGIN_SDK_VERSION (6)
     uint32_t              size_bytes;  // = sizeof(HostAbi)
@@ -690,6 +724,11 @@ typedef struct HostAbi {
     int32_t (*get_world_item_inner)(uintptr_t container_addr,
                                     EntityInfoAbi* out_e,
                                     ComponentAddressesAbi* out_c);
+
+    // OverlayServiceAbi — per-plugin overlay/data inclusion requests.
+    // Added 2026-05-26. See OverlayServiceAbi declaration above for
+    // full documentation.
+    OverlayServiceAbi overlay;
     // === END v6 EXTENSIONS ===
 } HostAbi;
 

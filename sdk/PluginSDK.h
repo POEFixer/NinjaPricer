@@ -128,6 +128,7 @@ class TerrainService;
 class MemoryService;
 class LogService;
 class EventsService;
+class OverlayService;
 class Plugin;
 struct Context;
 
@@ -1956,6 +1957,199 @@ public:
     }
 };
 
+// ============================================================================
+// OverlayService — per-plugin influence on overlay/data behavior
+// ============================================================================
+//
+// Two independent, idempotent "request flags" that a plugin can toggle to
+// change overlay-wide behavior for its own use case. Both follow the same
+// shape:
+//
+//     ctx()->Overlay.SetX(true);   // I want X
+//     ...
+//     ctx()->Overlay.SetX(false);  // I no longer want X
+//
+// The host stores per-plugin flags (keyed by your plugin `this`) and computes
+// the effective behavior as the OR of:
+//   - all enabled plugins' flags,
+//   - the host's own built-in needs (main menu visible, Radar's built-in
+//     "Add Entity from Map" picker, AutoCraft lock, etc.).
+//
+// Multiple plugins can request the same thing simultaneously without
+// interfering. The host clears all of a plugin's flags when it disables or
+// unloads the plugin — so a crash or a forgotten cleanup will NOT permanently
+// stick the overlay/data in the requested state. Well-behaved plugins still
+// pair their on/off calls so neighboring plugins and the player remain
+// responsive in the meantime.
+//
+// Latency: a Set call updates the per-plugin flag synchronously, but the
+// effective behavior change manifests on the next host frame (overlay
+// input) or the next GameClient worker tick (sleeping entities). For
+// typical plugin workflows the lag is sub-frame and unobservable.
+//
+// All methods are safe to call from any thread.
+class OverlayService {
+    const OverlayServiceAbi* m_abi = nullptr;
+    const HostAbi*           m_host = nullptr;
+    void*                    m_plugin_token = nullptr;  // = Plugin*, opaque to host
+public:
+    void Init(const OverlayServiceAbi* abi, const HostAbi* host, void* token) {
+        m_abi          = abi;
+        m_host         = host;
+        m_plugin_token = token;
+    }
+
+    // ── Gap 1: SetIncludeSleepingEntities ───────────────────────────────────
+    //
+    // Background
+    //   PoE2 keeps a large pool of far-away or dormant entities live in memory
+    //   but flagged "Useless" (EntityState::Useless). To keep snapshot cost
+    //   bounded, the host hides Useless entities from EntitiesService.Enumerate
+    //   by default — plugins only see active, nearby entities.
+    //
+    // Effect when enabled
+    //   Useless entities also appear in EntitiesService.Enumerate and
+    //   Snapshot.Entities. The Entity::IsSleeping flag marks specifically
+    //   those entities that came from the host's separate SleepingEntities
+    //   collection (orthogonal to EntityState::Useless — many entities are
+    //   Useless without being in that collection).
+    //
+    // When to use
+    //   - Map-picker UIs that need the full area entity pool (so you can let
+    //     the user click on an entity that's not yet active).
+    //   - Debug viewers showing every entity, sleeping or not.
+    //
+    // Cost
+    //   Roughly +5–15% snapshot CPU per frame in dense areas while enabled.
+    //   Negligible while disabled (default). Leave OFF unless you need it.
+    //
+    // Lifecycle
+    //   Idempotent. Auto-cleared on plugin disable/unload. Pair on/off calls.
+    void SetIncludeSleepingEntities(bool enable) const {
+        if (m_abi && m_abi->set_include_sleeping_entities) {
+            m_abi->set_include_sleeping_entities(m_plugin_token, enable ? 1 : 0);
+        }
+    }
+
+    // ── Gap 2: SetWantsOverlayInput ─────────────────────────────────────────
+    //
+    // Request that the overlay window starts CONSUMING mouse clicks (so your
+    // ImGui windows / popups receive them) instead of letting them pass
+    // through to the game underneath.
+    //
+    // ## Background — what "input capture" actually means here
+    //
+    // The overlay window is a transparent always-on-top child sitting on top
+    // of the PoE2 client window. In its default state it has the Win32 style
+    // WS_EX_TRANSPARENT: every mouse click passes straight through to the
+    // game underneath. This is the correct default for read-only overlays
+    // (radar, health-bar tracker, DPS readout) — the player keeps playing
+    // normally and never notices the overlay is there.
+    //
+    // The moment a plugin wants the user to CLICK ON SOMETHING INSIDE THE
+    // OVERLAY — confirm a popup button, pick an entity on the map, drag a
+    // marker, dismiss a modal — that default breaks: the click would land in
+    // the game and your popup would never see it. SetWantsOverlayInput(true)
+    // fixes this for the duration of your interactive mode.
+    //
+    // ## Effect when enabled
+    //
+    // The host's overlay input loop runs every frame. While ANY plugin (or
+    // the host itself) has this flag on:
+    //
+    //   - If the OS cursor is over a visible ImGui window owned by you or
+    //     any other plugin/host UI, the overlay temporarily clears
+    //     WS_EX_TRANSPARENT and the click is delivered to ImGui (and NOT to
+    //     the game). Your ImGui::Begin(...) window receives clicks normally.
+    //
+    //   - If the cursor is NOT over any visible ImGui window — the player is
+    //     clicking on the world — WS_EX_TRANSPARENT is restored and the click
+    //     reaches the game. Movement, attacks, looting all keep working.
+    //
+    // This per-frame "claim only what the user is actually over" behavior is
+    // what makes a heavy interactive overlay coexist with active gameplay.
+    //
+    // ## Scope — what this flag does and does NOT affect
+    //
+    //   - Mouse buttons (LMB/RMB): YES, gated by this flag.
+    //   - Mouse position / hover: ALWAYS works, regardless of this flag.
+    //     Tooltips and hover effects don't need this.
+    //   - Keyboard: ALWAYS reaches the plugin via the host's WindowProc, not
+    //     gated by this flag. ImGui::IsKeyPressed(ImGuiKey_Escape) etc. work
+    //     either way.
+    //   - Game input: only loses clicks where your ImGui window covers them.
+    //     The player can keep playing around your popup.
+    //
+    // ## Background-draw-list caveat — READ THIS for map-picker plugins
+    //
+    // If you draw clickable markers via ImGui::GetBackgroundDrawList() (typical
+    // for radar/large-map overlays), the background list has no ImGui window
+    // backing it. The host's "is the cursor over UI?" check walks the ImGui
+    // window list and finds nothing → click-through is re-enabled and your
+    // background-list click goes to the game.
+    //
+    // To make background-list clicks work, you need a real ImGui window the
+    // host's hit-test recognizes (HitTestInternal in radar/render/render.cpp
+    // iterates ctx->Windows; ImGui widgets like InvisibleButton are inside a
+    // window, not windows themselves). Choose one:
+    //
+    //   1. (RECOMMENDED) Open a full-screen ImGui window with no decoration
+    //      and put an InvisibleButton inside it. The window is what the host
+    //      hit-tests; the InvisibleButton gives you ImGui::IsItemClicked()
+    //      for click detection. Sketch:
+    //
+    //          ImGui::SetNextWindowPos({0, 0});
+    //          ImGui::SetNextWindowSize(screenSize);
+    //          ImGui::Begin("##picker", nullptr,
+    //              ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoTitleBar |
+    //              ImGuiWindowFlags_NoMove       | ImGuiWindowFlags_NoResize    |
+    //              ImGuiWindowFlags_NoScrollbar);
+    //          ImGui::InvisibleButton("##picker_hit", screenSize);
+    //          bool clicked = ImGui::IsItemClicked();
+    //          // ... draw markers via ImGui::GetForegroundDrawList() or
+    //          //     GetWindowDrawList(); do your world-space hit-test against
+    //          //     markers using ImGui::GetMousePos() vs marker screen pos ...
+    //          ImGui::End();
+    //
+    //   2. Same idea with a smaller window covering only the picker region
+    //      instead of full-screen. Pick whichever fits — the host doesn't
+    //      care about size, only that some window is under the cursor.
+    //
+    // ## When to use
+    //
+    //   - Plugin opens an ImGui popup/modal the user must click.
+    //   - Map-picker flows: click on an entity / POI marker.
+    //   - Drag-to-position UI for radar icons, custom overlays.
+    //
+    // ## When NOT to use
+    //
+    //   - Read-only overlays — leave OFF so the player isn't interrupted.
+    //   - Hover-only tooltips — ImGui hover always works.
+    //
+    // ## Aggregation across plugins and host
+    //
+    // OR'd with the host's built-in needs (main menu visible, AutoCraft locked,
+    // host's own map picker active) and every other plugin's flag. Multiple
+    // simultaneous requests coexist fine. The effective state is recomputed
+    // every frame from the aggregate.
+    //
+    // ## Lifecycle
+    //
+    // Remember to call SetWantsOverlayInput(false) when your interactive mode
+    // ends (user picked / pressed Escape / closed the popup). The host clears
+    // all of a plugin's flags automatically on OnDisable / unload, so a crash
+    // or a forgotten cleanup will NOT permanently stick the overlay in capture
+    // mode — but well-behaved plugins still pair their on/off calls so other
+    // plugins and the game stay responsive in between.
+    //
+    // Idempotent. Safe from any thread.
+    void SetWantsOverlayInput(bool enable) const {
+        if (m_abi && m_abi->set_wants_overlay_input) {
+            m_abi->set_wants_overlay_input(m_plugin_token, enable ? 1 : 0);
+        }
+    }
+};
+
 struct Context {
     GameService       Game;
     EntitiesService   Entities;
@@ -1967,6 +2161,7 @@ struct Context {
     MemoryService     Memory;
     LogService        Log;
     EventsService     Events;
+    OverlayService    Overlay;
     void* ImGuiContext = nullptr;
     void* D3DDevice    = nullptr;
 };
@@ -2064,6 +2259,7 @@ inline void PluginSDK_AttachHost(PluginSDK::Plugin* p,
     p->m_ctx.Memory    .Init(&abi->memory,     abi);
     p->m_ctx.Log       .Init(&abi->log,        abi);
     p->m_ctx.Events    .Init(&abi->events,     abi);
+    p->m_ctx.Overlay   .Init(&abi->overlay,    abi, p);   // p = plugin_token
     p->m_ctx.ImGuiContext = abi->imgui_context;
     p->m_ctx.D3DDevice    = abi->d3d_device;
 }
