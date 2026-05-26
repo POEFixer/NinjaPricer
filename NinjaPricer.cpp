@@ -382,7 +382,7 @@ public:
 
     void SaveSettings() override {
         namespace fs = std::filesystem;
-        fs::path configDir = fs::path(Directory()) / "config";
+        fs::path configDir = DirectoryPath() / "config";
         std::error_code ec;
         fs::create_directories(configDir, ec);
 
@@ -906,7 +906,7 @@ private:
 
     void LoadSettings() {
         namespace fs = std::filesystem;
-        fs::path settingsPath = fs::path(Directory()) / "config" / "settings.json";
+        fs::path settingsPath = DirectoryPath() / "config" / "settings.json";
         if (!fs::exists(settingsPath)) return;
 
         try {

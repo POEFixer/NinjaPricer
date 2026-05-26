@@ -19,6 +19,7 @@
 #include <functional>
 #include <map>
 #include <utility>
+#include <filesystem>
 #include <Windows.h>
 
 #ifdef PLUGIN_EXPORTS
@@ -2210,6 +2211,31 @@ protected:
 
     /// Absolute path to this plugin's directory (Plugins/<Name>/). UTF-8.
     const char* Directory() const { return m_directory.c_str(); }
+
+    /// Same as Directory() but returned as std::filesystem::path with the
+    /// proper UTF-8 → wide conversion baked in. Use this whenever you need
+    /// to construct fs::path / std::ifstream / CreateDirectoryW etc.
+    ///
+    /// Why: fs::path(std::string) on Windows interprets the string via the
+    /// system ANSI codepage, NOT UTF-8. If the host's exe lives in a folder
+    /// with non-ASCII chars (Cyrillic, CJK, …) and the system ACP isn't
+    /// UTF-8, the bytes get misinterpreted → mojibake wide path → file
+    /// operations land on the wrong location (often creating a sibling
+    /// folder with garbled name next to the real one). Going through
+    /// CP_UTF8 → wide → fs::path keeps the original chars intact.
+    std::filesystem::path DirectoryPath() const {
+        if (m_directory.empty()) return {};
+        int needed = ::MultiByteToWideChar(
+            CP_UTF8, 0, m_directory.c_str(),
+            static_cast<int>(m_directory.size()), nullptr, 0);
+        if (needed <= 0) return {};
+        std::wstring wide(static_cast<size_t>(needed), L'\0');
+        ::MultiByteToWideChar(
+            CP_UTF8, 0, m_directory.c_str(),
+            static_cast<int>(m_directory.size()),
+            wide.data(), needed);
+        return std::filesystem::path(wide);
+    }
 
     /// True if the host ABI version and size matched at attach time. When
     /// false, `m_ctx` is unpopulated and the plugin should refuse to function.
