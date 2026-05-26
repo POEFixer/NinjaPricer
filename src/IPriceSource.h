@@ -9,6 +9,7 @@
 #include <atomic>
 #include <algorithm>
 #include <cstdio>
+#include <filesystem>
 
 // Forward declare ImGui types (avoid pulling full imgui.h in header)
 #ifndef IM_COL32
@@ -269,9 +270,14 @@ class IPriceSource {
 public:
     virtual ~IPriceSource() = default;
     virtual const char* GetName() const = 0;  // "poe.ninja" or "poe2scout"
+    // cacheDir is std::filesystem::path (not std::string) so the wide
+    // representation survives end-to-end without going through the system
+    // ANSI codepage. Passing fs::path(Directory()) on Windows would
+    // misinterpret UTF-8 as CP_ACP and create mojibake folders next to the
+    // real plugin directory when the exe lives in a non-ASCII path.
     virtual void FetchCategories(
         const std::string& league,
-        const std::string& cacheDir,
+        const std::filesystem::path& cacheDir,
         const bool (&currencyEnabled)[kMaxCurrencyCategories],
         const bool (&uniqueEnabled)[kMaxUniqueCategories],
         PriceDatabase& db,

@@ -14,7 +14,7 @@ public:
 
     void FetchCategories(
         const std::string& league,
-        const std::string& cacheDir,
+        const std::filesystem::path& cacheDir,
         const bool (&currencyEnabled)[kMaxCurrencyCategories],
         const bool (&uniqueEnabled)[kMaxUniqueCategories],
         PriceDatabase& db,

@@ -345,11 +345,15 @@ inline std::vector<std::string> FetchLeagues() {
 // Cache (local JSON files)
 // ============================================================================
 
-inline void SaveCache(const std::string& dir, const std::string& league,
+// dir is std::filesystem::path: keep the wide form end-to-end. Passing a
+// UTF-8 std::string and constructing fs::path(string) on Windows would
+// reinterpret bytes via the system ANSI codepage and create the cache
+// folder under a mojibake parent directory.
+inline void SaveCache(const std::filesystem::path& dir, const std::string& league,
     const std::string& type, const std::string& jsonStr)
 {
     namespace fs = std::filesystem;
-    fs::path cacheDir = fs::path(dir) / "cache" / league;
+    fs::path cacheDir = dir / "cache" / league;
     if (!fs::exists(cacheDir))
         fs::create_directories(cacheDir);
 
@@ -357,11 +361,11 @@ inline void SaveCache(const std::string& dir, const std::string& league,
     if (f.is_open()) f << jsonStr;
 }
 
-inline std::string LoadCache(const std::string& dir, const std::string& league,
+inline std::string LoadCache(const std::filesystem::path& dir, const std::string& league,
     const std::string& type)
 {
     namespace fs = std::filesystem;
-    fs::path cachePath = fs::path(dir) / "cache" / league / (type + ".json");
+    fs::path cachePath = dir / "cache" / league / (type + ".json");
     if (!fs::exists(cachePath)) return "";
 
     std::ifstream f(cachePath);

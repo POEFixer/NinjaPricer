@@ -858,7 +858,7 @@ private:
                         ? static_cast<IPriceSource&>(m_NinjaSource)
                         : static_cast<IPriceSource&>(m_ScoutSource);
                     source.FetchCategories(
-                        m_League, std::string(Directory()),
+                        m_League, DirectoryPath(),
                         m_CurrencyEnabled, m_UniqueEnabled,
                         tempDb, m_IsLoading, m_Running,
                         &PriceApiLogBridge);

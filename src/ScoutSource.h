@@ -14,7 +14,7 @@ public:
 
     void FetchCategories(
         const std::string& league,
-        const std::string& cacheDir,
+        const std::filesystem::path& cacheDir,
         const bool (&currencyEnabled)[kMaxCurrencyCategories],
         const bool (&uniqueEnabled)[kMaxUniqueCategories],
         PriceDatabase& db,
@@ -66,7 +66,7 @@ private:
     void FetchCurrencyCategory(
         const char* apiId,
         const std::string& encodedLeague,
-        const std::string& cacheDir,
+        const std::filesystem::path& cacheDir,
         const std::string& league,
         PriceDatabase& db,
         std::atomic<bool>& running,
@@ -123,7 +123,7 @@ private:
     void FetchUniqueCategory(
         const char* apiId,
         const std::string& encodedLeague,
-        const std::string& cacheDir,
+        const std::filesystem::path& cacheDir,
         const std::string& league,
         PriceDatabase& db,
         std::atomic<bool>& running,
