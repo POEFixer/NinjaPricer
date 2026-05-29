@@ -353,9 +353,11 @@ inline void SaveCache(const std::filesystem::path& dir, const std::string& leagu
     const std::string& type, const std::string& jsonStr)
 {
     namespace fs = std::filesystem;
+    std::error_code ec;
     fs::path cacheDir = dir / "cache" / league;
-    if (!fs::exists(cacheDir))
-        fs::create_directories(cacheDir);
+    if (!fs::exists(cacheDir, ec))
+        fs::create_directories(cacheDir, ec);
+    if (ec) return;  // cache dir unavailable — skip silently (non-fatal)
 
     std::ofstream f(cacheDir / (type + ".json"));
     if (f.is_open()) f << jsonStr;
@@ -365,8 +367,9 @@ inline std::string LoadCache(const std::filesystem::path& dir, const std::string
     const std::string& type)
 {
     namespace fs = std::filesystem;
+    std::error_code ec;
     fs::path cachePath = dir / "cache" / league / (type + ".json");
-    if (!fs::exists(cachePath)) return "";
+    if (!fs::exists(cachePath, ec) || ec) return "";
 
     std::ifstream f(cachePath);
     if (!f.is_open()) return "";

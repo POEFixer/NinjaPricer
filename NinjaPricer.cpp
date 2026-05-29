@@ -851,31 +851,50 @@ private:
         m_FetchThread = std::thread([this]() {
             // Make the SDK log service available to PriceApiLogBridge on this thread.
             tls_logSvc = &ctx()->Log;
-            while (m_Running.load()) {
-                {
-                    PriceDatabase tempDb;
-                    IPriceSource& source = (m_DataSource == 0)
-                        ? static_cast<IPriceSource&>(m_NinjaSource)
-                        : static_cast<IPriceSource&>(m_ScoutSource);
-                    source.FetchCategories(
-                        m_League, DirectoryPath(),
-                        m_CurrencyEnabled, m_UniqueEnabled,
-                        tempDb, m_IsLoading, m_Running,
-                        &PriceApiLogBridge);
+            // Hard exception boundary. A plugin worker thread must NEVER let an
+            // exception escape — that calls std::terminate and kills the entire
+            // host process. A malformed/truncated price-API response makes
+            // nlohmann::json::parse throw parse_error; this is the last-resort
+            // backstop should any inner handler be bypassed.
+            try {
+                while (m_Running.load()) {
+                    {
+                        PriceDatabase tempDb;
+                        IPriceSource& source = (m_DataSource == 0)
+                            ? static_cast<IPriceSource&>(m_NinjaSource)
+                            : static_cast<IPriceSource&>(m_ScoutSource);
+                        source.FetchCategories(
+                            m_League, DirectoryPath(),
+                            m_CurrencyEnabled, m_UniqueEnabled,
+                            tempDb, m_IsLoading, m_Running,
+                            &PriceApiLogBridge);
 
-                    if (m_Running.load()) {
-                        std::unique_lock<std::shared_mutex> lock(m_DbMutex);
-                        m_PriceDb = std::move(tempDb);
+                        if (m_Running.load()) {
+                            std::unique_lock<std::shared_mutex> lock(m_DbMutex);
+                            m_PriceDb = std::move(tempDb);
+                        }
+                    }
+
+                    for (int i = 0; i < m_RefreshIntervalMin * 60 && m_Running.load(); i++) {
+                        Sleep(1000);
+                        if (m_ForceRefresh.load()) {
+                            m_ForceRefresh.store(false);
+                            break;
+                        }
                     }
                 }
-
-                for (int i = 0; i < m_RefreshIntervalMin * 60 && m_Running.load(); i++) {
-                    Sleep(1000);
-                    if (m_ForceRefresh.load()) {
-                        m_ForceRefresh.store(false);
-                        break;
-                    }
-                }
+            }
+            catch (const std::exception& e) {
+                m_IsLoading.store(false);
+                if (tls_logSvc)
+                    tls_logSvc->Log("Error",
+                        (std::string("[NinjaPricer] fetch thread aborted: ") + e.what()).c_str());
+            }
+            catch (...) {
+                m_IsLoading.store(false);
+                if (tls_logSvc)
+                    tls_logSvc->Log("Error",
+                        "[NinjaPricer] fetch thread aborted: unknown exception");
             }
             tls_logSvc = nullptr;
         });
