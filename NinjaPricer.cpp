@@ -26,13 +26,21 @@
 
 using namespace PriceApi;
 
-// Fallback leagues if API fetch fails
+// Fallback leagues if API fetch fails (current season first).
+// The live list comes from NinjaApi::FetchLeagues(); this is only used when that
+// request fails. Refresh the season entries each league.
 static const char* kFallbackLeagues[] = {
-    "Fate of the Vaal",
-    "HC Fate of the Vaal",
+    "Runes of Aldur",
+    "HC Runes of Aldur",
     "Standard",
     "Hardcore",
 };
+
+// Host-synthesized inventory ID for the Ritual shop ("Favours" window). The
+// host's ScanInventoryGrid publishes the shop grid under this ID (it is not a
+// real game inventory). Keep in sync with POEFixer/game_client/GameClientData.h
+// kRitualShopInventoryId.
+static constexpr int kRitualShopInventoryId = 10001;
 
 // Price text position for UI items (inventory/stash)
 enum class UiPricePosition : int {
@@ -259,6 +267,10 @@ public:
         ImGui::SameLine();
         ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f), "(may affect FPS)");
 
+        ImGui::Checkbox("Ritual", &m_ShowRitualPrices);
+        ImGui::SameLine();
+        ImGui::TextDisabled("(price items in the Ritual \"Favours\" shop)");
+
         ImGui::Checkbox("Hide when game not focused", &m_HideWhenUnfocused);
 
         ImGui::Separator();
@@ -365,7 +377,7 @@ public:
             DrawGroundItemPrices(snap);
         }
 
-        if (m_ShowInventoryPrices || m_ShowOtherInventoryPrices) {
+        if (m_ShowInventoryPrices || m_ShowOtherInventoryPrices || m_ShowRitualPrices) {
             auto now = std::chrono::steady_clock::now();
             if (now - m_LastInventoryScan > std::chrono::seconds(1)) {
                 ctx()->Inventory.Scan(-1);
@@ -395,6 +407,7 @@ public:
             j["showGroundPrices"] = m_ShowGroundPrices;
             j["showInventoryPrices"] = m_ShowInventoryPrices;
             j["showOtherInventoryPrices"] = m_ShowOtherInventoryPrices;
+            j["showRitualPrices"] = m_ShowRitualPrices;
             j["refreshIntervalMin"] = m_RefreshIntervalMin;
             j["hideWhenUnfocused"] = m_HideWhenUnfocused;
             j["hideHotkey"] = m_HideHotkey;
@@ -698,8 +711,14 @@ private:
             if (!inv.Grid.Valid || inv.Grid.CellSize < 1.0f) continue;
 
             const bool isPlayer = (inv.InventoryId == 1);
-            if (isPlayer  && !m_ShowInventoryPrices)      continue;
-            if (!isPlayer && !m_ShowOtherInventoryPrices) continue;
+            const bool isRitual = (inv.InventoryId == kRitualShopInventoryId);
+            if (isRitual) {
+                if (!m_ShowRitualPrices) continue;
+            } else if (isPlayer) {
+                if (!m_ShowInventoryPrices) continue;
+            } else {
+                if (!m_ShowOtherInventoryPrices) continue;
+            }
 
             DrawInventoryGrid(inv);
         }
@@ -937,6 +956,11 @@ private:
                 m_DataSource = std::clamp(j["dataSource"].get<int>(), 0, 1);
             if (j.contains("league") && j["league"].is_string())
                 m_League = j["league"].get<std::string>();
+            // League rollover (one-time): bump last season's default to the current
+            // league so existing configs stop pricing against the ended league.
+            // Deliberate choices (Standard / Hardcore / other) are preserved.
+            if (m_League == "Fate of the Vaal")          m_League = "Runes of Aldur";
+            else if (m_League == "HC Fate of the Vaal")  m_League = "HC Runes of Aldur";
             if (j.contains("displayCurrency") && j["displayCurrency"].is_number_integer())
                 m_DisplayCurrency =
                     static_cast<DisplayCurrency>(j["displayCurrency"].get<int>());
@@ -949,6 +973,8 @@ private:
             if (j.contains("showOtherInventoryPrices") &&
                 j["showOtherInventoryPrices"].is_boolean())
                 m_ShowOtherInventoryPrices = j["showOtherInventoryPrices"].get<bool>();
+            if (j.contains("showRitualPrices") && j["showRitualPrices"].is_boolean())
+                m_ShowRitualPrices = j["showRitualPrices"].get<bool>();
             if (j.contains("refreshIntervalMin") &&
                 j["refreshIntervalMin"].is_number_integer())
                 m_RefreshIntervalMin = std::clamp(j["refreshIntervalMin"].get<int>(), 15, 180);
@@ -996,12 +1022,13 @@ private:
     // Members
     // ========================================================================
 
-    std::string m_League = "Fate of the Vaal";
+    std::string m_League = "Runes of Aldur";
     DisplayCurrency m_DisplayCurrency = DisplayCurrency::Divine;
     float m_TextScale = 1.0f;
     bool m_ShowGroundPrices = true;
     bool m_ShowInventoryPrices = false;       // Off by default — minor frame-time impact
     bool m_ShowOtherInventoryPrices = false;  // Off by default — minor frame-time impact
+    bool m_ShowRitualPrices = true;           // On by default — Ritual "Favours" shop pricing
     int m_RefreshIntervalMin = 60;            // 60-min refresh - lighter on poe.ninja / poe2scout
     bool m_HideWhenUnfocused = true;
     int m_HideHotkey = 0;
