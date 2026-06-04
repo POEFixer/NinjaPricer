@@ -23,7 +23,7 @@ namespace PriceApi {
 // Constants
 // ============================================================================
 
-inline constexpr int kMaxCurrencyCategories = 15;
+inline constexpr int kMaxCurrencyCategories = 17;
 inline constexpr int kMaxUniqueCategories = 7;
 
 // ============================================================================
@@ -76,7 +76,7 @@ struct CategoryDef {
 // ============================================================================
 
 // Currency categories — indices 0-12 match existing kCategories[] order.
-// Indices 13-14 are poe2scout-only.
+// Indices 13-16 are poe2scout-only.
 // Label is the user-facing name shown in the UI.
 inline constexpr CategoryDef kCurrencyCategories[] = {
     { "Currency",          "Currency" },           // 0
@@ -94,6 +94,8 @@ inline constexpr CategoryDef kCurrencyCategories[] = {
     { "LineageSupportGems","Lineage Support Gems" },// 12
     { "vaultkeys",         "Reliquary Keys" },     // 13 — poe2scout only
     { "incursion",         "Incursion" },          // 14 — poe2scout only
+    { "verisium",          "Verisium" },           // 15 — poe2scout only
+    { "vaal",              "Vaal" },               // 16 — poe2scout only
 };
 
 // Unique categories — all poe2scout only
@@ -126,6 +128,8 @@ inline constexpr const char* kScoutCurrencyApiIds[] = {
     "lineagesupportgems",  // 12 — Lineage Support Gems
     "vaultkeys",           // 13 — Reliquary Keys (poe2scout only)
     "incursion",           // 14 — Incursion (poe2scout only)
+    "verisium",            // 15 — Verisium (poe2scout only)
+    "vaal",                // 16 — Vaal (poe2scout only)
 };
 
 // First index that is poe2scout-only (currency categories)
@@ -186,6 +190,23 @@ inline std::string FormatPrice(float value, DisplayCurrency currency) {
     else {
         snprintf(buf, sizeof(buf), "%.3f %s", value, suffix);
     }
+    return buf;
+}
+
+// Same number formatting as FormatPrice but WITHOUT the currency-letter suffix.
+// Used by the image price-display style, where the currency is shown as an icon.
+inline std::string FormatPriceNumber(float value) {
+    char buf[32];
+    if (value >= 10000.0f) {
+        float k = value / 1000.0f;
+        if (k >= 10.0f) snprintf(buf, sizeof(buf), "%.0fk", k);
+        else            snprintf(buf, sizeof(buf), "%.1fk", k);
+    }
+    else if (value >= 1000.0f) snprintf(buf, sizeof(buf), "%.1fk", value / 1000.0f);
+    else if (value >= 100.0f)  snprintf(buf, sizeof(buf), "%.0f", value);
+    else if (value >= 1.0f)    snprintf(buf, sizeof(buf), "%.1f", value);
+    else if (value >= 0.01f)   snprintf(buf, sizeof(buf), "%.2f", value);
+    else                       snprintf(buf, sizeof(buf), "%.3f", value);
     return buf;
 }
 

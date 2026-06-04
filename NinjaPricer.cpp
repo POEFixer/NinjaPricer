@@ -7,6 +7,13 @@
 
 #include "sdk/PluginSDK.h"
 #include <imgui.h>
+#include <d3d11.h>
+
+// stb_image for loading currency icon PNGs (image price-display style).
+// Implementation lives in this single plugin TU.
+#define STB_IMAGE_IMPLEMENTATION
+#define STBI_ONLY_PNG
+#include <stb_image.h>
 
 #include "src/IPriceSource.h"
 #include "src/NinjaSource.h"
@@ -22,6 +29,7 @@
 #include <atomic>
 #include <unordered_map>
 #include <map>
+#include <vector>
 #include <algorithm>
 
 using namespace PriceApi;
@@ -60,6 +68,14 @@ enum class GroundPricePosition : int {
 };
 static const char* kGroundPositionNames[] = { "Top", "Bottom", "Left", "Right" };
 
+// How the price value is rendered: as text with a currency-letter suffix
+// ("2.5 D"), or as the numeric value followed by the currency icon ("2.5" + img).
+enum class PriceDisplayStyle : int {
+    Image = 0,   // value + currency icon (default)
+    Text  = 1,   // value + letter suffix
+};
+static const char* kPriceDisplayStyleNames[] = { "Image (icon)", "Text" };
+
 // Virtual key name helper
 static const char* GetVkName(int vk) {
     if (vk == 0) return "None";
@@ -87,6 +103,7 @@ class NinjaPricerPlugin : public PluginSDK::Plugin {
 public:
     ~NinjaPricerPlugin() override {
         StopFetchThread();
+        ReleaseCurrencyTextures();
     }
 
     // ========================================================================
@@ -106,6 +123,7 @@ public:
 
     void OnDisable() override {
         StopFetchThread();
+        ReleaseCurrencyTextures();
         ctx()->Log.Info("[NinjaPricer] Plugin disabled");
     }
 
@@ -222,6 +240,15 @@ public:
         ImGui::RadioButton("Exalted (E)", &dc, 1); ImGui::SameLine();
         ImGui::RadioButton("Chaos (C)", &dc, 2);
         m_DisplayCurrency = static_cast<DisplayCurrency>(dc);
+
+        ImGui::Spacing();
+        ImGui::Text("Price style:");
+        int ps = static_cast<int>(m_PriceDisplayStyle);
+        ImGui::RadioButton(kPriceDisplayStyleNames[0], &ps, 0); ImGui::SameLine();
+        ImGui::RadioButton(kPriceDisplayStyleNames[1], &ps, 1);
+        m_PriceDisplayStyle = static_cast<PriceDisplayStyle>(ps);
+        ImGui::SameLine();
+        ImGui::TextDisabled("(icon = value + currency image)");
 
         ImGui::SliderFloat("Text size", &m_TextScale, 0.5f, 2.0f, "%.1f");
 
@@ -413,6 +440,7 @@ public:
             j["hideHotkey"] = m_HideHotkey;
             j["uiPricePosition"] = static_cast<int>(m_UiPricePosition);
             j["groundPricePosition"] = static_cast<int>(m_GroundPricePosition);
+            j["priceDisplayStyle"] = static_cast<int>(m_PriceDisplayStyle);
 
             nlohmann::json curr = nlohmann::json::array();
             for (int i = 0; i < kMaxCurrencyCategories; i++)
@@ -628,19 +656,16 @@ private:
             if (!ctx()->Render.WorldToScreen(e.WorldX, e.WorldY, e.WorldZ, sx, sy))
                 continue;
 
-            std::string text = FormatPrice(displayValue, m_DisplayCurrency);
-            ImVec2 ts = ImGui::CalcTextSize(text.c_str());
-            float sw = ts.x * (baseFontSize / baseRefSize);
-            float sh = ts.y * (baseFontSize / baseRefSize);
+            PriceTag tag = MeasurePriceTag(displayValue, baseFontSize);
 
             // Anchor is a single screen point (zero-sized box). CalcGroundPricePos
-            // already centres text around (sx, sy) with the four presets.
-            float textX, textY;
+            // already centres the block around (sx, sy) with the four presets.
+            float blockX, blockY;
             CalcGroundPricePos(sx, sy, /*labelW=*/0.0f, /*labelH=*/0.0f,
-                               sw, sh, baseFontSize, textX, textY);
+                               tag.totalW, tag.totalH, baseFontSize, blockX, blockY);
 
-            DrawPriceLabelAt(dl, baseFontSize, textX, textY, sw, sh, text,
-                             price.chaosValue * stackMultiplier);
+            DrawPriceTag(dl, baseFontSize, blockX, blockY, tag,
+                         price.chaosValue * stackMultiplier);
         }
     }
 
@@ -683,24 +708,31 @@ private:
             float displayValue = GetDisplayValue(price, m_DisplayCurrency) * multiplier;
             if (displayValue < 0.001f) continue;
 
-            std::string text = FormatPrice(displayValue, m_DisplayCurrency);
-
-            float cellX = inv.Grid.GridScreenX + item.SlotX * inv.Grid.CellSize;
-            float cellY = inv.Grid.GridScreenY + item.SlotY * inv.Grid.CellSize;
-            float cellW = item.Width * inv.Grid.CellSize;
-            float cellH = item.Height * inv.Grid.CellSize;
+            // Special stash tabs (currency/fragments/expedition/...) arrange their
+            // cells freely, not on a uniform grid — the host resolves each item's
+            // real screen rect from its per-slot UI element. Use it when present;
+            // otherwise fall back to grid math (regular tabs / player inventory).
+            float cellX, cellY, cellW, cellH;
+            if (item.ScreenValid) {
+                cellX = item.ScreenX;
+                cellY = item.ScreenY;
+                cellW = item.ScreenW;
+                cellH = item.ScreenH;
+            } else {
+                cellX = inv.Grid.GridScreenX + item.SlotX * inv.Grid.CellSize;
+                cellY = inv.Grid.GridScreenY + item.SlotY * inv.Grid.CellSize;
+                cellW = item.Width * inv.Grid.CellSize;
+                cellH = item.Height * inv.Grid.CellSize;
+            }
 
             float fontSize = ComputeAdaptiveFontSize(baseFontSize, cellW, cellH);
 
-            ImVec2 ts = ImGui::CalcTextSize(text.c_str());
-            float sw = ts.x * (fontSize / ImGui::GetFontSize());
-            float sh = ts.y * (fontSize / ImGui::GetFontSize());
+            PriceTag tag = MeasurePriceTag(displayValue, fontSize);
 
             float labelX, labelY;
-            CalcUiPricePos(cellX, cellY, cellW, cellH, sw, sh, 2.0f, labelX, labelY);
+            CalcUiPricePos(cellX, cellY, cellW, cellH, tag.totalW, tag.totalH, 2.0f, labelX, labelY);
 
-            DrawPriceLabelAt(dl, fontSize, labelX, labelY, sw, sh, text,
-                             price.chaosValue * multiplier);
+            DrawPriceTag(dl, fontSize, labelX, labelY, tag, price.chaosValue * multiplier);
         }
     }
 
@@ -728,14 +760,164 @@ private:
     // Drawing Helpers
     // ========================================================================
 
-    void DrawPriceLabelAt(ImDrawList* dl, float fontSize, float x, float y,
-        float w, float h, const std::string& text, float chaosValue)
+    // ---- Currency icon textures (image price-display style) ----------------
+
+    struct CurrencyTex {
+        ImTextureID id = ImTextureID{};
+        ID3D11ShaderResourceView* srv = nullptr;
+        int w = 0;
+        int h = 0;
+        bool valid = false;
+    };
+
+    // A measured, ready-to-draw price label. In text style it is plain text; in
+    // image style it is value-text + currency icon. totalW/totalH bound the whole
+    // block so callers anchor it exactly like the old text label.
+    struct PriceTag {
+        std::string text;
+        float textW = 0.0f, textH = 0.0f;
+        const CurrencyTex* tex = nullptr;   // null => render text only
+        float iconW = 0.0f, iconH = 0.0f, gap = 0.0f;
+        float totalW = 0.0f, totalH = 0.0f;
+    };
+
+    static constexpr float kIconHeightMul = 1.4f;   // icon height vs text line height
+
+    void LoadCurrencyTexture(int idx) {
+        if (idx < 0 || idx > 2) return;
+        auto* device = static_cast<ID3D11Device*>(ctx()->D3DDevice);
+        if (!device) return;
+
+        // Index matches DisplayCurrency: Divine=0, Exalted=1, Chaos=2.
+        static const wchar_t* kFiles[3] = { L"divine.png", L"exalted.png", L"chaos.png" };
+
+        // Resources sit next to the host executable. Absolute + wide path so a
+        // non-ASCII install directory (Russian/Chinese/...) still resolves.
+        wchar_t exePath[MAX_PATH] = {};
+        if (GetModuleFileNameW(nullptr, exePath, MAX_PATH) == 0) return;
+        std::filesystem::path p = std::filesystem::path(exePath).parent_path()
+            / L"Resources" / L"currency" / L"poe2" / kFiles[idx];
+
+        std::ifstream f(p, std::ios::binary);
+        if (!f.is_open()) return;
+        std::vector<unsigned char> bytes(
+            (std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        if (bytes.empty()) return;
+
+        int w = 0, h = 0;
+        unsigned char* data = stbi_load_from_memory(
+            bytes.data(), static_cast<int>(bytes.size()), &w, &h, nullptr, 4);
+        if (!data) return;
+
+        D3D11_TEXTURE2D_DESC desc = {};
+        desc.Width = static_cast<UINT>(w);
+        desc.Height = static_cast<UINT>(h);
+        desc.MipLevels = 1;
+        desc.ArraySize = 1;
+        desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        desc.SampleDesc.Count = 1;
+        desc.Usage = D3D11_USAGE_DEFAULT;
+        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+        D3D11_SUBRESOURCE_DATA init = {};
+        init.pSysMem = data;
+        init.SysMemPitch = static_cast<UINT>(w * 4);
+
+        ID3D11Texture2D* tex = nullptr;
+        HRESULT hr = device->CreateTexture2D(&desc, &init, &tex);
+        stbi_image_free(data);
+        if (FAILED(hr) || !tex) return;
+
+        ID3D11ShaderResourceView* srv = nullptr;
+        D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+        srvDesc.Format = desc.Format;
+        srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        srvDesc.Texture2D.MipLevels = 1;
+        hr = device->CreateShaderResourceView(tex, &srvDesc, &srv);
+        tex->Release();
+        if (FAILED(hr) || !srv) return;
+
+        m_CurrencyTex[idx].srv   = srv;
+        m_CurrencyTex[idx].id    = reinterpret_cast<ImTextureID>(srv);
+        m_CurrencyTex[idx].w     = w;
+        m_CurrencyTex[idx].h     = h;
+        m_CurrencyTex[idx].valid = true;
+    }
+
+    const CurrencyTex* GetCurrencyTexture(DisplayCurrency c) {
+        int idx = static_cast<int>(c);   // Divine=0, Exalted=1, Chaos=2
+        if (idx < 0 || idx > 2) return nullptr;
+        if (!m_CurrencyTexTried[idx]) {
+            m_CurrencyTexTried[idx] = true;   // try once; don't retry every frame
+            LoadCurrencyTexture(idx);
+        }
+        return m_CurrencyTex[idx].valid ? &m_CurrencyTex[idx] : nullptr;
+    }
+
+    void ReleaseCurrencyTextures() {
+        for (int i = 0; i < 3; i++) {
+            if (m_CurrencyTex[i].srv) m_CurrencyTex[i].srv->Release();
+            m_CurrencyTex[i] = CurrencyTex{};
+            m_CurrencyTexTried[i] = false;
+        }
+    }
+
+    // ---- Price label measure + draw ----------------------------------------
+
+    // Measure a price label at the given font size, honoring the display style.
+    // Falls back to text when the icon texture is unavailable (missing PNG / no device).
+    PriceTag MeasurePriceTag(float displayValue, float fontSize) {
+        PriceTag tag;
+        float ref = ImGui::GetFontSize();
+        float scale = (ref > 0.0f) ? (fontSize / ref) : 1.0f;
+
+        const CurrencyTex* tex = (m_PriceDisplayStyle == PriceDisplayStyle::Image)
+            ? GetCurrencyTexture(m_DisplayCurrency) : nullptr;
+
+        if (tex) {
+            tag.text = PriceApi::FormatPriceNumber(displayValue);
+            ImVec2 ts = ImGui::CalcTextSize(tag.text.c_str());
+            tag.textW = ts.x * scale;
+            tag.textH = ts.y * scale;
+            tag.tex   = tex;
+            tag.iconH = tag.textH * kIconHeightMul;
+            float aspect = (tex->h > 0) ? (static_cast<float>(tex->w) / tex->h) : 1.0f;
+            tag.iconW = tag.iconH * aspect;
+            tag.gap   = fontSize * 0.15f;
+            tag.totalW = tag.textW + tag.gap + tag.iconW;
+            tag.totalH = tag.iconH;   // icon is the taller element
+        } else {
+            tag.text = PriceApi::FormatPrice(displayValue, m_DisplayCurrency);
+            ImVec2 ts = ImGui::CalcTextSize(tag.text.c_str());
+            tag.textW = ts.x * scale;
+            tag.textH = ts.y * scale;
+            tag.totalW = tag.textW;
+            tag.totalH = tag.textH;
+        }
+        return tag;
+    }
+
+    // Draw a measured price label with its top-left at (x, y).
+    void DrawPriceTag(ImDrawList* dl, float fontSize, float x, float y,
+        const PriceTag& tag, float chaosValue)
     {
         float pad = 2.0f;
-        dl->AddRectFilled(ImVec2(x - pad, y - pad), ImVec2(x + w + pad, y + h + pad),
+        dl->AddRectFilled(ImVec2(x - pad, y - pad),
+            ImVec2(x + tag.totalW + pad, y + tag.totalH + pad),
             IM_COL32(0, 0, 0, 200), 2.0f);
-        dl->AddText(ImGui::GetFont(), fontSize, ImVec2(x, y),
-            PriceApi::GetPriceColor(chaosValue, m_CachedDivineInChaos), text.c_str());
+
+        ImU32 col = PriceApi::GetPriceColor(chaosValue, m_CachedDivineInChaos);
+        if (tag.tex) {
+            // Value text vertically centered against the (taller) icon.
+            float textY = y + (tag.totalH - tag.textH) * 0.5f;
+            dl->AddText(ImGui::GetFont(), fontSize, ImVec2(x, textY), col, tag.text.c_str());
+            float iconX = x + tag.textW + tag.gap;
+            float iconY = y + (tag.totalH - tag.iconH) * 0.5f;
+            dl->AddImage(tag.tex->id, ImVec2(iconX, iconY),
+                ImVec2(iconX + tag.iconW, iconY + tag.iconH));
+        } else {
+            dl->AddText(ImGui::GetFont(), fontSize, ImVec2(x, y), col, tag.text.c_str());
+        }
     }
 
     float ComputeAdaptiveFontSize(float baseFontSize, float cellW, float cellH) {
@@ -989,6 +1171,9 @@ private:
                 j["groundPricePosition"].is_number_integer())
                 m_GroundPricePosition =
                     static_cast<GroundPricePosition>(j["groundPricePosition"].get<int>());
+            if (j.contains("priceDisplayStyle") && j["priceDisplayStyle"].is_number_integer())
+                m_PriceDisplayStyle = static_cast<PriceDisplayStyle>(
+                    std::clamp(j["priceDisplayStyle"].get<int>(), 0, 1));
 
             if (j.contains("currencyEnabled") && j["currencyEnabled"].is_array()) {
                 auto& arr = j["currencyEnabled"];
@@ -1024,6 +1209,7 @@ private:
 
     std::string m_League = "Runes of Aldur";
     DisplayCurrency m_DisplayCurrency = DisplayCurrency::Divine;
+    PriceDisplayStyle m_PriceDisplayStyle = PriceDisplayStyle::Image;  // default: icon
     float m_TextScale = 1.0f;
     bool m_ShowGroundPrices = true;
     bool m_ShowInventoryPrices = false;       // Off by default — minor frame-time impact
@@ -1037,7 +1223,8 @@ private:
     int m_DataSource = 1;
     bool m_CurrencyEnabled[kMaxCurrencyCategories] = {
         true, true, true, true, true, true, true, true,
-        true, true, true, true, true, true, true
+        true, true, true, true, true, true, true, true,
+        true
     };
     bool m_UniqueEnabled[kMaxUniqueCategories] = {
         true, true, true, true, true, true, true
@@ -1078,6 +1265,13 @@ private:
 
     // UI state
     bool m_CapturingHotkey = false;
+
+    // Currency icon textures (image price style). Lazily loaded from
+    // Resources/currency/poe2/{divine,exalted,chaos}.png, indexed by
+    // DisplayCurrency; released on disable/destroy. CurrencyTex is declared in
+    // the Drawing Helpers section above.
+    CurrencyTex m_CurrencyTex[3];
+    bool        m_CurrencyTexTried[3] = { false, false, false };
 };
 
 // ============================================================================

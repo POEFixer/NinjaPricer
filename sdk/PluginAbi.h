@@ -270,7 +270,23 @@ typedef struct {
     int32_t animation_id;
     uintptr_t animation_name_addr;
     // Active skills walked via ComponentsServiceAbi::enumerate_active_skills.
+    // === ActorAbi APPEND-ONLY extension (added 2026-06-04, WhereAreYouGoing) ===
+    // SAFE: host allocates+writes this struct; older plugin DLLs read only the
+    // leading fields and ignore the trailing bytes. Never reorder.
+    int32_t action_flags;   // raw Actor ActionId (+0x2A0): 0=idle, 0x1080=running, bit 0x400 = using ability
+    int32_t action_dest_x;  // current-action target grid X (Actor+0x1D4); valid while the unit is acting
+    int32_t action_dest_y;  // current-action target grid Y (Actor+0x1D8)
 } ActorAbi;
+
+// Pathfinding route snapshot — a unit's destination waypoints in grid (cell)
+// coordinates, filled by HostAbi::read_pathfinding. POE2 stores the route
+// inline as a (0,0)-terminated Vector2i array; node_count is the number of
+// non-terminator nodes read (capped at the fixed buffer size).
+typedef struct {
+    int32_t valid;
+    int32_t node_count;
+    struct { int32_t x, y; } nodes[64];
+} PathfindingAbi;
 
 typedef struct {
     int32_t valid;
@@ -338,6 +354,7 @@ typedef struct {
     uintptr_t charges, mods, stack, transitionable;
     uintptr_t state_machine, dies_after_time;
     uintptr_t triggerable_blockage, omp;
+    uintptr_t pathfinding;   // APPEND-ONLY (2026-06-04): Pathfinding component address
 } ComponentAddressesAbi;
 
 typedef struct {
@@ -432,6 +449,16 @@ typedef struct {
     uintptr_t path_addr;
     uintptr_t base_type_name_addr;
     uintptr_t unique_name_addr;
+    // Visual cell rect on screen (px). Resolved from per-slot UI elements for
+    // special stash tabs (currency/fragments/expedition/...) whose items are NOT
+    // on a uniform grid. screen_valid == 0 => fall back to grid math
+    // (grid_screen_x + slot_x*cell_size). APPEND-ONLY (v6 ABI extension; new
+    // fields at the struct tail only — older plugins ignore them safely).
+    float     screen_x;
+    float     screen_y;
+    float     screen_w;
+    float     screen_h;
+    int32_t   screen_valid;
 } InventoryItemAbi;
 
 typedef struct {
@@ -792,6 +819,12 @@ typedef struct HostAbi {
     // FlasksServiceAbi — flask/charm convenience data for plugins.
     // Added 2026-05-26. See FlasksServiceAbi declaration above for details.
     FlasksServiceAbi flasks;
+
+    // read_pathfinding — fill PathfindingAbi with a unit's movement route
+    // (Vector2i grid waypoints) read from its Pathfinding component address
+    // (ComponentAddressesAbi::pathfinding). Returns 1 on success; 0 on null
+    // out / unreadable / no route. Added 2026-06-04 (WhereAreYouGoing plugin).
+    int32_t (*read_pathfinding)(uintptr_t pathfinding_addr, PathfindingAbi* out);
     // === END v6 EXTENSIONS ===
 } HostAbi;
 

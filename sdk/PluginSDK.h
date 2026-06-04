@@ -460,16 +460,27 @@ struct Stats {
 struct Actor {
     std::string AnimationName;
     int         AnimationId = 0;
+    int         ActionFlags = 0;   // raw ActionId bitmask (bit 0x400 = using ability)
+    int         ActionDestX = 0;   // current-action target grid X (valid while acting)
+    int         ActionDestY = 0;   // current-action target grid Y
     bool        Valid = false;
+
+    bool IsUsingAbility() const { return (ActionFlags & 0x400) != 0; }
 
     static Actor FromAbi(const ActorAbi& a, const HostAbi* abi) {
         Actor ac;
         ac.AnimationId   = a.animation_id;
+        ac.ActionFlags   = a.action_flags;
+        ac.ActionDestX   = a.action_dest_x;
+        ac.ActionDestY   = a.action_dest_y;
         ac.Valid         = a.valid != 0;
         ac.AnimationName = FetchString(a.animation_name_addr, abi);
         return ac;
     }
 };
+
+// A single Pathfinding route waypoint in grid (cell) coordinates.
+struct PathNode { int X = 0; int Y = 0; };
 
 struct Npc {
     uintptr_t EntityOwnerAddress = 0;
@@ -792,6 +803,16 @@ struct InventoryItem {
     std::string BaseTypeName;
     std::string UniqueName;
 
+    // Visual cell rect on screen (px). Valid only for special stash tabs
+    // (currency/fragments/expedition/...) whose cells are not on a uniform grid.
+    // When ScreenValid is false, position items via the inventory Grid instead
+    // (Grid.GridScreenX + SlotX*Grid.CellSize).
+    float     ScreenX = 0.0f;
+    float     ScreenY = 0.0f;
+    float     ScreenW = 0.0f;
+    float     ScreenH = 0.0f;
+    bool      ScreenValid = false;
+
     static InventoryItem FromAbi(const InventoryItemAbi& a, const HostAbi* abi) {
         InventoryItem i;
         i.Address          = a.address;
@@ -810,6 +831,11 @@ struct InventoryItem {
         i.Path             = FetchString(a.path_addr, abi);
         i.BaseTypeName     = FetchString(a.base_type_name_addr, abi);
         i.UniqueName       = FetchString(a.unique_name_addr, abi);
+        i.ScreenX          = a.screen_x;
+        i.ScreenY          = a.screen_y;
+        i.ScreenW          = a.screen_w;
+        i.ScreenH          = a.screen_h;
+        i.ScreenValid      = a.screen_valid != 0;
         return i;
     }
 };
@@ -930,6 +956,7 @@ struct ComponentAddresses {
     uintptr_t Charges = 0, Mods = 0, Stack = 0, Transitionable = 0;
     uintptr_t StateMachine = 0, DiesAfterTime = 0;
     uintptr_t TriggerableBlockage = 0, OMP = 0;
+    uintptr_t Pathfinding = 0;
 
     static ComponentAddresses FromAbi(const ComponentAddressesAbi& a) {
         ComponentAddresses c;
@@ -957,6 +984,7 @@ struct ComponentAddresses {
         c.DiesAfterTime        = a.dies_after_time;
         c.TriggerableBlockage  = a.triggerable_blockage;
         c.OMP                  = a.omp;
+        c.Pathfinding          = a.pathfinding;
         return c;
     }
 
@@ -984,6 +1012,7 @@ struct ComponentAddresses {
     bool HasDiesAfterTime() const       { return DiesAfterTime != 0; }
     bool HasTriggerableBlockage() const { return TriggerableBlockage != 0; }
     bool HasOMP() const                 { return OMP != 0; }
+    bool HasPathfinding() const         { return Pathfinding != 0; }
 };
 
 using EntityComponents = ComponentAddresses;
@@ -1367,6 +1396,23 @@ public:
         if (m_abi && m_abi->read_actor && m_abi->read_actor(addr, &a))
             return Actor::FromAbi(a, m_host);
         return {};
+    }
+
+    // Unit movement route (grid waypoints) from a Pathfinding component
+    // address (Entity::Components.Pathfinding). Routes through the top-level
+    // HostAbi::read_pathfinding (append-only); empty if no route / unreadable.
+    std::vector<PathNode> ReadPathfinding(uintptr_t pathfindingAddr) const {
+        std::vector<PathNode> out;
+        if (!m_host || !m_host->read_pathfinding || pathfindingAddr == 0) return out;
+        PathfindingAbi a{};
+        if (!m_host->read_pathfinding(pathfindingAddr, &a) || a.valid == 0) return out;
+        int count = a.node_count;
+        if (count < 0) count = 0;
+        if (count > 64) count = 64;
+        out.reserve(static_cast<size_t>(count));
+        for (int i = 0; i < count; ++i)
+            out.push_back(PathNode{ a.nodes[i].x, a.nodes[i].y });
+        return out;
     }
     Npc ReadNpc(uintptr_t addr) const {
         NpcAbi a{};
