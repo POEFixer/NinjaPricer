@@ -1000,10 +1000,16 @@ private:
     bool IsGameWindowFocused() {
         HWND fg = GetForegroundWindow();
         if (!fg) return false;
+        // Match by window class — the game's title bar is localized (e.g. the
+        // Chinese client shows "流放之路：降临"), so title matching fails there.
+        wchar_t cls[256] = {};
+        GetClassNameW(fg, cls, 256);
+        if (wcscmp(cls, L"POEWindowClass") == 0 || wcscmp(cls, L"POE2WindowClass") == 0)
+            return true;
+        // Our own overlay window (title contains "POEFixer", not localized).
         wchar_t title[256] = {};
         GetWindowTextW(fg, title, 256);
-        return (wcsstr(title, L"Path of Exile") != nullptr ||
-                wcsstr(title, L"POEFixer") != nullptr);
+        return wcsstr(title, L"POEFixer") != nullptr;
     }
 
     // ========================================================================
