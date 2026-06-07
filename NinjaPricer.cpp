@@ -28,6 +28,7 @@
 #include <shared_mutex>
 #include <atomic>
 #include <unordered_map>
+#include <unordered_set>
 #include <map>
 #include <vector>
 #include <algorithm>
@@ -49,6 +50,12 @@ static const char* kFallbackLeagues[] = {
 // real game inventory). Keep in sync with POEFixer/game_client/GameClientData.h
 // kRitualShopInventoryId.
 static constexpr int kRitualShopInventoryId = 10001;
+
+// UI element StringId offset (0.5.0). Read directly via the Memory service:
+// the host's ctx()->Ui.GetStringId() bridge still uses the stale pre-0.5.0
+// 0x448 offset (Bridge_Ui.cpp), so it returns garbage on 0.5.x. Live-verified:
+// the StringId StdWString lives at +0x4c0.
+static constexpr uintptr_t kUiStringIdOffset = 0x4c0;
 
 // Price text position for UI items (inventory/stash)
 enum class UiPricePosition : int {
@@ -298,6 +305,10 @@ public:
         ImGui::SameLine();
         ImGui::TextDisabled("(price items in the Ritual \"Favours\" shop)");
 
+        ImGui::Checkbox("Runeshape", &m_ShowRuneshapePrices);
+        ImGui::SameLine();
+        ImGui::TextDisabled("(price rewards in the Runeshape Combinations panel)");
+
         ImGui::Checkbox("Hide when game not focused", &m_HideWhenUnfocused);
 
         ImGui::Separator();
@@ -392,6 +403,10 @@ public:
             m_CachedInventories.clear();
             m_RarityCache.clear();
             m_LastInventoryScan = {};   // force immediate refresh in new area
+            m_RuneshapeListAddr = 0;
+            m_RuneshapeWindowAddr = 0;
+            m_RuneshapeRows.clear();
+            m_LastRuneshapeScan = {};
             m_LastAreaChange = snap.AreaChangeCounter;
         }
 
@@ -417,6 +432,15 @@ public:
             }
             DrawInventoryOverlays();
         }
+
+        if (m_ShowRuneshapePrices) {
+            auto nowR = std::chrono::steady_clock::now();
+            if (nowR - m_LastRuneshapeScan > std::chrono::seconds(1)) {
+                ScanRuneshapeRows();
+                m_LastRuneshapeScan = nowR;
+            }
+            DrawRuneshapeOverlay(snap);
+        }
     }
 
     void SaveSettings() override {
@@ -435,6 +459,7 @@ public:
             j["showInventoryPrices"] = m_ShowInventoryPrices;
             j["showOtherInventoryPrices"] = m_ShowOtherInventoryPrices;
             j["showRitualPrices"] = m_ShowRitualPrices;
+            j["showRuneshapePrices"] = m_ShowRuneshapePrices;
             j["refreshIntervalMin"] = m_RefreshIntervalMin;
             j["hideWhenUnfocused"] = m_HideWhenUnfocused;
             j["hideHotkey"] = m_HideHotkey;
@@ -1048,6 +1073,258 @@ private:
     }
 
     // ========================================================================
+    // Runeshape Combinations overlay — UI tree helpers
+    // ========================================================================
+
+    // ASCII-narrow a wide string. Reward StringIds are English/ASCII in memory.
+    static std::string RuneNarrow(const std::wstring& w) {
+        std::string s;
+        s.reserve(w.size());
+        for (wchar_t c : w) s += (c < 128) ? static_cast<char>(c) : '?';
+        return s;
+    }
+
+    // Parent address of a UI element (0 on failure / invalid).
+    uintptr_t UiParent(uintptr_t addr) {
+        return addr ? ctx()->Ui.Read(addr).ParentAddress : 0;
+    }
+
+    // Read a UI element's StringId (the StdWString at +0x4c0), narrowed to ASCII.
+    std::string ReadUiStringId(uintptr_t elemAddr) {
+        if (!elemAddr) return std::string();
+        std::wstring ws = ctx()->Memory.ReadStdWString(elemAddr + kUiStringIdOffset);
+        return ws.empty() ? std::string() : RuneNarrow(ws);
+    }
+
+    // Parse a reward label "Nx ItemName" -> {qty, name}; no "Nx " prefix -> {1, label}.
+    // Returns false for labels we never price: the panel title, the unused tab
+    // placeholders, and skill rewards.
+    static bool ParseReward(const std::string& label, int& outQty, std::string& outName) {
+        if (label.empty()) return false;
+        if (label == "Runeshape Combinations") return false;
+        if (label.rfind("[dnt-", 0) == 0) return false;   // "[dnt-unused] tab one/two"
+        if (label.rfind("Skill:", 0) == 0) return false;   // skill rewards: not tradeable
+
+        int qty = 0;
+        size_t i = 0;
+        while (i < label.size() && label[i] >= '0' && label[i] <= '9') {
+            qty = qty * 10 + (label[i] - '0');
+            i++;
+        }
+        if (i > 0 && i + 1 < label.size() && label[i] == 'x' && label[i + 1] == ' ') {
+            outQty = (qty < 1) ? 1 : qty;
+            outName = label.substr(i + 2);
+            return !outName.empty();
+        }
+        outQty = 1;
+        outName = label;
+        return true;
+    }
+
+    // Return a recipe row's reward-label element: the first child that carries a
+    // non-empty StringId (the symbol icons carry none). 0 if the row has no label.
+    uintptr_t GetRowLabelElement(uintptr_t row) {
+        if (!row) return 0;
+        for (uintptr_t c : ctx()->Ui.GetChildren(row)) {
+            if (c && !ctx()->Memory.ReadStdWString(c + kUiStringIdOffset).empty())
+                return c;
+        }
+        return 0;
+    }
+
+    // A displayed recipe row has rune-symbol icon children (~50x50 unscaled). The
+    // label-only reward-pool rows ("Bonus Reward", ...) have none — this tells the
+    // recipe list apart from pools during discovery.
+    bool RowHasSymbol(uintptr_t row) {
+        if (!row) return false;
+        for (uintptr_t c : ctx()->Ui.GetChildren(row)) {
+            if (!c) continue;
+            PluginSDK::UiElement e = ctx()->Ui.Read(c);
+            if (e.Valid && e.UnscaledWidth >= 30.0f && e.UnscaledWidth <= 80.0f
+                        && e.UnscaledHeight >= 30.0f && e.UnscaledHeight <= 80.0f)
+                return true;
+        }
+        return false;
+    }
+
+    // Bounded BFS for the element whose StringId == target. When visibleOnly,
+    // only descend into visible nodes (cheap while the panel is open).
+    uintptr_t BfsFindStringId(uintptr_t root, const char* target,
+                              bool visibleOnly, int budget) {
+        if (!root) return 0;
+        std::vector<uintptr_t> q;
+        q.reserve(1024);
+        q.push_back(root);
+        std::unordered_set<uintptr_t> seen;
+        size_t head = 0;
+        int n = 0;
+        while (head < q.size() && n < budget) {
+            uintptr_t node = q[head++];
+            if (!node || seen.count(node)) continue;
+            seen.insert(node);
+            n++;
+            std::string id = ReadUiStringId(node);
+            if (!id.empty() && id == target) return node;
+            if (node == root || !visibleOnly || ctx()->Ui.IsVisible(node)) {
+                for (uintptr_t c : ctx()->Ui.GetChildren(node))
+                    if (c && !seen.count(c)) q.push_back(c);
+            }
+        }
+        return 0;
+    }
+
+    // Bounded BFS for the first element whose StringId parses as a reward label AND
+    // whose row (parent) has rune-symbol children — i.e. a real recipe row, not a
+    // flat reward-pool entry. Anchors discovery onto the recipe list specifically.
+    uintptr_t BfsFindRecipeLabel(uintptr_t root, int budget) {
+        if (!root) return 0;
+        std::vector<uintptr_t> q;
+        q.push_back(root);
+        std::unordered_set<uintptr_t> seen;
+        size_t head = 0;
+        int n = 0;
+        while (head < q.size() && n < budget) {
+            uintptr_t node = q[head++];
+            if (!node || seen.count(node)) continue;
+            seen.insert(node);
+            n++;
+            std::string id = ReadUiStringId(node);
+            if (!id.empty()) {
+                int qty; std::string name;
+                if (ParseReward(id, qty, name)
+                    && RowHasSymbol(ctx()->Ui.Read(node).ParentAddress))
+                    return node;
+            }
+            for (uintptr_t c : ctx()->Ui.GetChildren(node))
+                if (c && !seen.count(c)) q.push_back(c);
+        }
+        return 0;
+    }
+
+    // Find (and cache) the recipe row-list of the open "Runeshape Combinations"
+    // panel (the list whose rows carry rune symbols — not the flat reward pools).
+    // Returns 0 when the panel isn't present. Once cached, the address is
+    // revalidated cheaply on every call (no BFS); the expensive BFS rediscovery is
+    // backed off to ~3 s so a closed panel (the common case) costs little — the
+    // trade-off is up to ~3 s before prices appear after opening the panel.
+    uintptr_t FindRuneshapeRowList() {
+        // Fast path: cached list still hosts at least one reward row?
+        if (m_RuneshapeListAddr) {
+            for (uintptr_t row : ctx()->Ui.GetChildren(m_RuneshapeListAddr)) {
+                if (GetRowLabelElement(row)) return m_RuneshapeListAddr;
+            }
+            m_RuneshapeListAddr = 0;   // stale — rediscover below
+            m_RuneshapeWindowAddr = 0;
+        }
+
+        auto now = std::chrono::steady_clock::now();
+        if (now - m_LastRuneshapeDiscover < std::chrono::seconds(3)) return 0;
+        m_LastRuneshapeDiscover = now;
+
+        // True UI root = parent of the HUD root that GetUiRoot() returns.
+        uintptr_t hudRoot = ctx()->Ui.GetUiRoot();
+        if (!hudRoot) return 0;
+        uintptr_t urs = UiParent(hudRoot);
+        if (!urs) return 0;
+
+        // Title is the stable anchor; visible-pruned BFS reaches it only while the
+        // panel is open (its ancestor chain is visible then) — also keeps it cheap.
+        uintptr_t title = BfsFindStringId(urs, "Runeshape Combinations", true, 40000);
+        if (!title) return 0;
+
+        // Walk up to the panel's top-level window (the direct child of urs). Its own
+        // visible bit is the open/closed gate used by ScanRuneshapeRows.
+        uintptr_t window = title;
+        for (int i = 0; i < 16; i++) {
+            uintptr_t p = UiParent(window);
+            if (p == urs || p == 0) break;
+            window = p;
+        }
+
+        // Find one recipe-row label (its row has rune symbols) inside the window;
+        // cache its grandparent (the row-list): label.parent == row, row.parent == list.
+        uintptr_t anyLabel = BfsFindRecipeLabel(window, 8000);
+        if (!anyLabel) return 0;
+        uintptr_t row = UiParent(anyLabel);
+        uintptr_t list = row ? UiParent(row) : 0;
+        if (!list) return 0;
+        m_RuneshapeWindowAddr = window;
+        m_RuneshapeListAddr = list;
+        return list;
+    }
+
+    // ========================================================================
+    // Runeshape Combinations overlay — scan + draw
+    // ========================================================================
+
+    // Rebuild m_RuneshapeRows from the open panel. Runs at ~1 Hz under the
+    // m_DbMutex shared_lock (held by DrawUI). Each entry is a priced reward with
+    // its label's screen rect captured at scan time.
+    void ScanRuneshapeRows() {
+        m_RuneshapeRows.clear();
+        if (!m_ShowRuneshapePrices) return;
+
+        uintptr_t list = FindRuneshapeRowList();
+        if (!list) return;
+        // Panel-open gate: the runeshape window's own visible bit clears when the
+        // panel is closed, even though the cached subtree (and row bits) persist.
+        if (m_RuneshapeWindowAddr && !ctx()->Ui.IsVisible(m_RuneshapeWindowAddr)) return;
+
+        for (uintptr_t row : ctx()->Ui.GetChildren(list)) {
+            // The list holds hundreds of rows but the game marks only the handful of
+            // *displayed* rows with the row's own visible bit; the rest are parked
+            // off-screen at relY=0. Without this filter every parked priceable row
+            // draws as a smear across the top of the panel.
+            if (!ctx()->Ui.IsVisible(row)) continue;
+
+            uintptr_t label = GetRowLabelElement(row);
+            if (!label) continue;
+            std::string text = ReadUiStringId(label);
+            int qty; std::string name;
+            if (!ParseReward(text, qty, name)) continue;
+
+            PriceLookupResult price = LookupPrice(m_PriceDb, name);
+            if (!price.found) continue;
+
+            float total = GetDisplayValue(price, m_DisplayCurrency) * qty;
+            if (total < 0.001f) continue;
+
+            float x, y, w, h;
+            if (!ctx()->Ui.ComputeScreenRect(label, x, y, w, h)) continue;
+
+            RuneshapeRow rr;
+            rr.x = x; rr.y = y; rr.w = w; rr.h = h;
+            rr.total = total;
+            rr.chaos = price.chaosValue * qty;
+            m_RuneshapeRows.push_back(rr);
+        }
+    }
+
+    // Draw the cached priced rows. The price block is placed just LEFT of the
+    // reward label (the empty mid-gap between symbols and reward text), so it
+    // never overflows the panel's right edge. Off-screen rows are skipped.
+    void DrawRuneshapeOverlay(const PluginSDK::Snapshot& snap) {
+        if (m_RuneshapeRows.empty()) return;
+        ImDrawList* dl = ImGui::GetForegroundDrawList();
+        float baseFontSize = ImGui::GetFontSize() * m_TextScale;
+
+        for (const auto& r : m_RuneshapeRows) {
+            if (r.y + r.h < 0.0f || r.y > snap.ScreenHeight) continue;
+            if (r.x + r.w < 0.0f || r.x > snap.ScreenWidth)  continue;
+
+            // No adaptive shrink: the price draws in the open gap beside the reward
+            // text (not inside a tiny cell), so use the full configured size.
+            float fontSize = baseFontSize;
+            PriceTag tag = MeasurePriceTag(r.total, fontSize);
+
+            float gap = fontSize * 0.4f;
+            float labelX = r.x - tag.totalW - gap;
+            float labelY = r.y + (r.h - tag.totalH) * 0.5f;
+            DrawPriceTag(dl, fontSize, labelX, labelY, tag, r.chaos);
+        }
+    }
+
+    // ========================================================================
     // Fetch Thread
     // ========================================================================
 
@@ -1163,6 +1440,8 @@ private:
                 m_ShowOtherInventoryPrices = j["showOtherInventoryPrices"].get<bool>();
             if (j.contains("showRitualPrices") && j["showRitualPrices"].is_boolean())
                 m_ShowRitualPrices = j["showRitualPrices"].get<bool>();
+            if (j.contains("showRuneshapePrices") && j["showRuneshapePrices"].is_boolean())
+                m_ShowRuneshapePrices = j["showRuneshapePrices"].get<bool>();
             if (j.contains("refreshIntervalMin") &&
                 j["refreshIntervalMin"].is_number_integer())
                 m_RefreshIntervalMin = std::clamp(j["refreshIntervalMin"].get<int>(), 15, 180);
@@ -1221,6 +1500,7 @@ private:
     bool m_ShowInventoryPrices = false;       // Off by default — minor frame-time impact
     bool m_ShowOtherInventoryPrices = false;  // Off by default — minor frame-time impact
     bool m_ShowRitualPrices = true;           // On by default — Ritual "Favours" shop pricing
+    bool m_ShowRuneshapePrices = true;        // On by default — Runeshape Combinations reward pricing
     int m_RefreshIntervalMin = 60;            // 60-min refresh - lighter on poe.ninja / poe2scout
     bool m_HideWhenUnfocused = true;
     int m_HideHotkey = 0;
@@ -1264,6 +1544,23 @@ private:
     // Per-item rarity cache for the unique-category gate. Keyed by
     // InventoryItem::Address, cleared alongside m_CachedInventories.
     std::unordered_map<uintptr_t, int> m_RarityCache;
+
+    // ---- Runeshape Combinations overlay ----
+    // Cached row-list container of the open "Runeshape Combinations" panel
+    // (0 = not found). Rediscovered via bounded BFS on cache-miss, throttled.
+    uintptr_t m_RuneshapeListAddr = 0;
+    uintptr_t m_RuneshapeWindowAddr = 0;   // runeshape window; own visible bit = panel open/closed
+    std::chrono::steady_clock::time_point m_LastRuneshapeDiscover;
+    std::chrono::steady_clock::time_point m_LastRuneshapeScan;
+
+    // One priced, positioned reward row. Rebuilt on the 1 Hz scan tick; drawn
+    // each frame. Rect is the reward-label element's screen rect at scan time.
+    struct RuneshapeRow {
+        float x = 0, y = 0, w = 0, h = 0;   // reward-label screen rect
+        float total = 0;                     // display-currency value (unit * qty)
+        float chaos = 0;                     // chaos value (unit * qty), for color
+    };
+    std::vector<RuneshapeRow> m_RuneshapeRows;
 
     // League cache
     std::vector<std::string> m_Leagues;
