@@ -403,10 +403,12 @@ public:
             m_CachedInventories.clear();
             m_RarityCache.clear();
             m_LastInventoryScan = {};   // force immediate refresh in new area
+            m_InvReadPending = false;
             m_RuneshapeListAddr = 0;
             m_RuneshapeWindowAddr = 0;
             m_RuneshapeRows.clear();
             m_LastRuneshapeScan = {};
+            m_LastRuneshapeDiscover = {};   // allow immediate rediscovery in the new area
             m_LastAreaChange = snap.AreaChangeCounter;
         }
 
@@ -415,27 +417,75 @@ public:
 
         m_CachedDivineInChaos = m_PriceDb.divineInChaos;
 
+        // Reset per-frame perf accumulators (TimedLookup feeds these).
+        m_PerfLookupMs = 0.0;
+        m_PerfLookupExact = m_PerfLookupContains = m_PerfLookupMiss = 0;
+
         if (m_ShowGroundPrices) {
+            double tg0 = PerfNowMs();
             DrawGroundItemPrices(snap);
+            m_PerfGroundMs = PerfNowMs() - tg0;
+            if (m_PerfGroundMs > m_PerfPeakGroundMs) m_PerfPeakGroundMs = m_PerfGroundMs;
         }
 
         if (m_ShowInventoryPrices || m_ShowOtherInventoryPrices || m_ShowRitualPrices) {
             auto now = std::chrono::steady_clock::now();
-            if (now - m_LastInventoryScan > std::chrono::seconds(1)) {
+
+            // Read fires this long after the request. It MUST be strictly shorter
+            // than the interval — otherwise the next request keeps resetting
+            // m_LastInventoryScan before the read condition is ever reached, the
+            // read never runs, and the overlay shows nothing (the 50 ms bug).
+            int readDelayMs = (std::min)(kInvReadDelayMs, m_PerfScanIntervalMs / 2);
+
+            // 1) Fire an async scan request on the interval. Scan() only flags the
+            //    host worker (~0 ms); the worker fills the snapshot within ~1 cycle.
+            if (now - m_LastInventoryScan > std::chrono::milliseconds(m_PerfScanIntervalMs)) {
+                double ts0 = PerfNowMs();
                 ctx()->Inventory.Scan(-1);
-                // Single GetAll() per scan tick — without this cache, every
-                // frame at 60 FPS pays the full ABI cost: bridge enumerate
-                // + per-inventory enumerate_items + 3× FetchString per item.
-                m_CachedInventories = ctx()->Inventory.GetAll();
-                m_RarityCache.clear();
+                m_PerfScanCallMs = PerfNowMs() - ts0;
+                if (m_PerfScanCallMs > m_PerfPeakScanCallMs) m_PerfPeakScanCallMs = m_PerfScanCallMs;
                 m_LastInventoryScan = now;
+                m_InvReadPending = true;
             }
+
+            // 2) Read the result ~one worker cycle AFTER the request — NOT in the
+            //    same tick. The old same-tick GetAll() always returned the PREVIOUS
+            //    request's snapshot, so the overlay lagged reality by a full extra
+            //    interval (the 1-3 s delay). Decoupling makes total latency ≈
+            //    interval + one worker cycle, so a modest interval already feels
+            //    instant without scanning fast enough to burden the worker.
+            if (m_InvReadPending &&
+                now - m_LastInventoryScan >= std::chrono::milliseconds(readDelayMs)) {
+                double tg0 = PerfNowMs();
+                m_CachedInventories = ctx()->Inventory.GetAll();
+                m_PerfGetAllMs = PerfNowMs() - tg0;
+                if (m_PerfGetAllMs > m_PerfPeakGetAllMs) m_PerfPeakGetAllMs = m_PerfGetAllMs;
+                m_RarityCache.clear();
+                m_PerfCachedInvCount = static_cast<int>(m_CachedInventories.size());
+                int items = 0;
+                for (const auto& iv : m_CachedInventories) items += static_cast<int>(iv.Items.size());
+                m_PerfCachedItemCount = items;
+                m_InvReadPending = false;
+            }
+
+            double td0 = PerfNowMs();
             DrawInventoryOverlays();
+            m_PerfDrawInvMs = PerfNowMs() - td0;
+            if (m_PerfDrawInvMs > m_PerfPeakDrawInvMs) m_PerfPeakDrawInvMs = m_PerfDrawInvMs;
         }
+
+        // Finalize per-frame lookup peaks (after all draw paths contributed).
+        if (m_PerfLookupMs > m_PerfPeakLookupMs) m_PerfPeakLookupMs = m_PerfLookupMs;
+        if (m_PerfLookupContains > m_PerfPeakLookupContains)
+            m_PerfPeakLookupContains = m_PerfLookupContains;
 
         if (m_ShowRuneshapePrices) {
             auto nowR = std::chrono::steady_clock::now();
-            if (nowR - m_LastRuneshapeScan > std::chrono::seconds(1)) {
+            // 400 ms refresh: when the panel is open the rebuild is cheap (cached
+            // list, fast-path), so a tighter cadence just makes prices appear and
+            // track sooner. The expensive UI-tree rediscovery is separately backed
+            // off inside FindRuneshapeRowList.
+            if (nowR - m_LastRuneshapeScan > std::chrono::milliseconds(400)) {
                 ScanRuneshapeRows();
                 m_LastRuneshapeScan = nowR;
             }
@@ -466,6 +516,7 @@ public:
             j["uiPricePosition"] = static_cast<int>(m_UiPricePosition);
             j["groundPricePosition"] = static_cast<int>(m_GroundPricePosition);
             j["priceDisplayStyle"] = static_cast<int>(m_PriceDisplayStyle);
+            j["scanIntervalMs"] = m_PerfScanIntervalMs;
 
             nlohmann::json curr = nlohmann::json::array();
             for (int i = 0; i < kMaxCurrencyCategories; i++)
@@ -489,10 +540,63 @@ private:
     // Debug Panel
     // ========================================================================
 
+    // Live performance breakdown for diagnosing the price-overlay display delay.
+    // All numbers are render-thread (DrawUI). The host-side (worker-thread) scan
+    // cost lives separately in the app's Debug -> DataVis -> "Inventory Scan".
+    void DrawPerfSection() {
+        ImGui::Spacing();
+        ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f), "Performance (render thread):");
+
+        // The single knob most likely to affect perceived latency. Lower it and
+        // watch whether the delay shrinks — if it does and the timings below stay
+        // low, the bottleneck was the throttle, not the read.
+        ImGui::SetNextItemWidth(220.0f);
+        ImGui::SliderInt("Inventory scan interval (ms)", &m_PerfScanIntervalMs, 50, 2000);
+        ImGui::SameLine();
+        ImGui::TextDisabled("(default 100; read is decoupled, so this stays cheap)");
+
+        auto row = [](const char* label, double last, double peak, double warn, double bad) {
+            ImVec4 c = (peak > bad) ? ImVec4(1.0f, 0.35f, 0.35f, 1.0f)
+                     : (peak > warn) ? ImVec4(1.0f, 0.85f, 0.2f, 1.0f)
+                     : ImVec4(0.5f, 0.9f, 0.5f, 1.0f);
+            ImGui::Text("  %-26s", label);
+            ImGui::SameLine(240);
+            ImGui::TextColored(c, "%.3f ms   (peak %.3f ms)", last, peak);
+        };
+
+        ImGui::Spacing();
+        row("Scan() request:",     m_PerfScanCallMs, m_PerfPeakScanCallMs, 0.5, 2.0);
+        row("GetAll() (ABI):",     m_PerfGetAllMs,   m_PerfPeakGetAllMs,   1.0, 5.0);
+        row("DrawInventory/frame:",m_PerfDrawInvMs,  m_PerfPeakDrawInvMs,  1.0, 4.0);
+        row("DrawGround/frame:",   m_PerfGroundMs,   m_PerfPeakGroundMs,   1.0, 4.0);
+        row("LookupPrice/frame:",  m_PerfLookupMs,   m_PerfPeakLookupMs,   0.5, 3.0);
+
+        ImGui::Spacing();
+        ImGui::Text("  LookupPrice this frame: %d exact, %d contains (O(N), peak %d), %d miss",
+            m_PerfLookupExact, m_PerfLookupContains, m_PerfPeakLookupContains, m_PerfLookupMiss);
+        ImGui::Text("  Cached: %d inventories, %d items   |   Price DB: %d entries",
+            m_PerfCachedInvCount, m_PerfCachedItemCount,
+            [this] { std::shared_lock<std::shared_mutex> l(m_DbMutex); return (int)m_PriceDb.items.size(); }());
+
+        if (ImGui::Button("Reset peaks")) {
+            m_PerfPeakScanCallMs = m_PerfPeakGetAllMs = m_PerfPeakDrawInvMs = 0.0;
+            m_PerfPeakGroundMs = m_PerfPeakLookupMs = 0.0;
+            m_PerfPeakLookupContains = 0;
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("Worker-thread scan cost: app Debug -> DataVis -> Inventory Scan");
+
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+    }
+
     void DrawDebugPanel() {
         PluginSDK::Snapshot snap = ctx()->Game.GetSnapshot();
 
         ImGui::Text("Source: %s", (m_DataSource == 0) ? "poe.ninja" : "poe2scout");
+
+        DrawPerfSection();
 
         ImGui::TextColored(ImVec4(0.6f, 0.8f, 1.0f, 1.0f), "Price Database:");
         {
@@ -650,7 +754,7 @@ private:
             std::string name = GetGroundLookupName(e);
             if (name.empty()) continue;
 
-            PriceLookupResult price = LookupPrice(m_PriceDb, name);
+            PriceLookupResult price = TimedLookup(name);
             if (!price.found) continue;
 
             // Resolve the inner item once; reused for both unique-rarity gate
@@ -710,7 +814,7 @@ private:
             std::string displayName = GetItemLookupName(item);
             if (displayName.empty()) continue;
 
-            PriceLookupResult price = LookupPrice(m_PriceDb, displayName);
+            PriceLookupResult price = TimedLookup(displayName);
             if (!price.found) continue;
 
             if (IsUniqueCategory(price.category) && item.Address) {
@@ -1073,6 +1177,34 @@ private:
     }
 
     // ========================================================================
+    // Perf diagnostics helpers
+    // ========================================================================
+
+    // High-resolution wall clock in milliseconds (QPC). Frequency is constant for
+    // the process lifetime, so it is queried once and cached.
+    static double PerfNowMs() {
+        static const LARGE_INTEGER freq = [] {
+            LARGE_INTEGER f; QueryPerformanceFrequency(&f); return f;
+        }();
+        LARGE_INTEGER c; QueryPerformanceCounter(&c);
+        return static_cast<double>(c.QuadPart) * 1000.0 / static_cast<double>(freq.QuadPart);
+    }
+
+    // LookupPrice wrapper that accumulates per-frame timing + match-kind counts
+    // into the m_Perf* fields. Used by the hot per-frame draw paths (ground +
+    // inventory). The caller must already hold m_DbMutex (DrawUI does).
+    PriceLookupResult TimedLookup(const std::string& name) {
+        int kind = 0;
+        double t0 = PerfNowMs();
+        PriceLookupResult r = LookupPrice(m_PriceDb, name, &kind);
+        m_PerfLookupMs += (PerfNowMs() - t0);
+        if (kind == 1)      ++m_PerfLookupExact;
+        else if (kind == 2) ++m_PerfLookupContains;
+        else                ++m_PerfLookupMiss;
+        return r;
+    }
+
+    // ========================================================================
     // Runeshape Combinations overlay — UI tree helpers
     // ========================================================================
 
@@ -1217,8 +1349,13 @@ private:
             m_RuneshapeWindowAddr = 0;
         }
 
+        // Rediscovery backoff. The cheap fast-path above handles the steady state
+        // (open panel, cached list), so this only gates the expensive visible-tree
+        // BFS while no list is cached — i.e. before the first open in an area, or
+        // briefly after the game tears the subtree down. 800 ms keeps first-open
+        // latency low while the visibleOnly BFS stays cheap when the panel is shut.
         auto now = std::chrono::steady_clock::now();
-        if (now - m_LastRuneshapeDiscover < std::chrono::seconds(3)) return 0;
+        if (now - m_LastRuneshapeDiscover < std::chrono::milliseconds(800)) return 0;
         m_LastRuneshapeDiscover = now;
 
         // True UI root = parent of the HUD root that GetUiRoot() returns.
@@ -1459,6 +1596,8 @@ private:
             if (j.contains("priceDisplayStyle") && j["priceDisplayStyle"].is_number_integer())
                 m_PriceDisplayStyle = static_cast<PriceDisplayStyle>(
                     std::clamp(j["priceDisplayStyle"].get<int>(), 0, 1));
+            if (j.contains("scanIntervalMs") && j["scanIntervalMs"].is_number_integer())
+                m_PerfScanIntervalMs = std::clamp(j["scanIntervalMs"].get<int>(), 50, 2000);
 
             if (j.contains("currencyEnabled") && j["currencyEnabled"].is_array()) {
                 auto& arr = j["currencyEnabled"];
@@ -1544,6 +1683,39 @@ private:
     // Per-item rarity cache for the unique-category gate. Keyed by
     // InventoryItem::Address, cleared alongside m_CachedInventories.
     std::unordered_map<uintptr_t, int> m_RarityCache;
+
+    // ---- Perf diagnostics (Debug tab "Performance" section) ----------------
+    // All render-thread (DrawUI) timings, in milliseconds, peak-held. The scan-
+    // call/get-all timings update only on a scan tick; draw/lookup update every
+    // frame. Purpose: localize the price-overlay delay to one of —
+    //   Scan()     : host async request cost (expected ~0; confirms decoupling)
+    //   GetAll()   : ABI marshaling of every inventory/item across the bridge
+    //   DrawInv    : per-frame inventory overlay (incl. LookupPrice)
+    //   Ground     : per-frame ground-item overlay (incl. LookupPrice + ABI)
+    //   Lookup     : time + count of LookupPrice, split exact vs O(N) contains
+    // m_PerfScanIntervalMs is the (tunable) inventory refresh throttle. With the
+    // decoupled read below, perceived latency ≈ interval + one worker cycle, so a
+    // modest default already feels instant. kInvReadDelayMs is how long after the
+    // async Scan() request we pick up the worker's result (≈ one 60 FPS cycle).
+    static constexpr int kInvReadDelayMs = 60;
+    int    m_PerfScanIntervalMs = 100;    // was hardcoded 1000 ms (caused 1-3 s lag)
+    bool   m_InvReadPending = false;      // a Scan() was requested; result not yet read
+    double m_PerfScanCallMs = 0.0;
+    double m_PerfGetAllMs = 0.0;
+    double m_PerfDrawInvMs = 0.0;
+    double m_PerfGroundMs = 0.0;
+    double m_PerfLookupMs = 0.0;          // per-frame sum across all draw paths
+    double m_PerfPeakScanCallMs = 0.0;
+    double m_PerfPeakGetAllMs = 0.0;
+    double m_PerfPeakDrawInvMs = 0.0;
+    double m_PerfPeakGroundMs = 0.0;
+    double m_PerfPeakLookupMs = 0.0;
+    int    m_PerfLookupExact = 0;         // per-frame counts (reset each DrawUI)
+    int    m_PerfLookupContains = 0;
+    int    m_PerfLookupMiss = 0;
+    int    m_PerfPeakLookupContains = 0;
+    int    m_PerfCachedInvCount = 0;
+    int    m_PerfCachedItemCount = 0;
 
     // ---- Runeshape Combinations overlay ----
     // Cached row-list container of the open "Runeshape Combinations" panel

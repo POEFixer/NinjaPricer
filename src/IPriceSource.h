@@ -234,13 +234,19 @@ inline bool IsUniqueCategory(const std::string& category) {
     return false;
 }
 
-inline PriceLookupResult LookupPrice(const PriceDatabase& db, const std::string& itemName) {
+// outMatchKind (optional, diagnostic): 0 = no match, 1 = exact O(1) hashmap hit,
+// 2 = contains-match (the O(N) full-DB substring scan). NinjaPricer's perf panel
+// uses this to count how often the expensive contains path runs per frame.
+inline PriceLookupResult LookupPrice(const PriceDatabase& db, const std::string& itemName,
+                                     int* outMatchKind = nullptr) {
     std::string key = ToLower(itemName);
 
     // 1. Exact match (fast, O(1))
     auto it = db.items.find(key);
-    if (it != db.items.end())
+    if (it != db.items.end()) {
+        if (outMatchKind) *outMatchKind = 1;
         return MakeResult(db, it->second);
+    }
 
     // 2. Contains match: if the game's display name contains a db key
     //    e.g. "headhunter heavy belt" contains "headhunter"
@@ -256,10 +262,13 @@ inline PriceLookupResult LookupPrice(const PriceDatabase& db, const std::string&
                 bestLen = dbKey.size();
             }
         }
-        if (bestMatch)
+        if (bestMatch) {
+            if (outMatchKind) *outMatchKind = 2;
             return MakeResult(db, *bestMatch);
+        }
     }
 
+    if (outMatchKind) *outMatchKind = 0;
     return PriceLookupResult{};
 }
 
