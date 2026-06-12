@@ -1245,11 +1245,22 @@ private:
         }
         if (i > 0 && i + 1 < label.size() && label[i] == 'x' && label[i + 1] == ' ') {
             outQty = (qty < 1) ? 1 : qty;
-            outName = label.substr(i + 2);
-            return !outName.empty();
+            outName = label.substr(i + 2);   // strip the "Nx " quantity prefix
+        } else {
+            outQty = 1;
+            outName = label;
         }
-        outQty = 1;
-        outName = label;
+        if (outName.empty()) return false;
+
+        // Generic unique-class rewards ("Unique Ring", "Unique Belt", "Unique
+        // Amulet", "Unique Body Armour", ...) describe a RANDOM unique of that slot
+        // — there is no single tradeable item, so they have no meaningful price.
+        // Left unfiltered they slip past the exact lookup and land on LookupPrice's
+        // contains-match onto an unrelated unique whose name is a substring (e.g.
+        // "Unique Ring" -> a ~23 div unique), painting a bogus price on the panel.
+        // No real reward item name begins with the rarity word "Unique ".
+        if (outName.rfind("Unique ", 0) == 0) return false;
+
         return true;
     }
 
