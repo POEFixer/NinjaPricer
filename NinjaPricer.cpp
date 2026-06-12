@@ -1405,9 +1405,10 @@ private:
     // Runeshape Combinations overlay — scan + draw
     // ========================================================================
 
-    // Rebuild m_RuneshapeRows from the open panel. Runs at ~1 Hz under the
-    // m_DbMutex shared_lock (held by DrawUI). Each entry is a priced reward with
-    // its label's screen rect captured at scan time.
+    // Rebuild m_RuneshapeRows from the open panel. Runs on the 400 ms tick under
+    // the m_DbMutex shared_lock (held by DrawUI). Each entry is a priced reward;
+    // geometry is intentionally NOT captured here — rects go stale within one
+    // scroll step, so DrawRuneshapeOverlay re-reads them every frame.
     void ScanRuneshapeRows() {
         m_RuneshapeRows.clear();
         if (!m_ShowRuneshapePrices) return;
@@ -1419,10 +1420,12 @@ private:
         if (m_RuneshapeWindowAddr && !ctx()->Ui.IsVisible(m_RuneshapeWindowAddr)) return;
 
         for (uintptr_t row : ctx()->Ui.GetChildren(list)) {
-            // The list holds hundreds of rows but the game marks only the handful of
-            // *displayed* rows with the row's own visible bit; the rest are parked
-            // off-screen at relY=0. Without this filter every parked priceable row
-            // draws as a smear across the top of the panel.
+            // The list holds hundreds of rows; only the materialized ones carry the
+            // row's own visible bit — the rest are parked at relY=0 and would smear
+            // across the top of the panel if priced. NOTE: when the list is long
+            // enough to scroll, rows below the fold ALSO keep their visible bit
+            // (the game clips them to the viewport at render time), so this filter
+            // alone is not enough — the draw pass clips geometrically.
             if (!ctx()->Ui.IsVisible(row)) continue;
 
             uintptr_t label = GetRowLabelElement(row);
@@ -1437,28 +1440,60 @@ private:
             float total = GetDisplayValue(price, m_DisplayCurrency) * qty;
             if (total < 0.001f) continue;
 
-            float x, y, w, h;
-            if (!ctx()->Ui.ComputeScreenRect(label, x, y, w, h)) continue;
-
             RuneshapeRow rr;
-            rr.x = x; rr.y = y; rr.w = w; rr.h = h;
+            rr.rowAddr = row;
+            rr.labelAddr = label;
             rr.total = total;
             rr.chaos = price.chaosValue * qty;
             m_RuneshapeRows.push_back(rr);
         }
     }
 
-    // Draw the cached priced rows. The price block is placed just LEFT of the
-    // reward label (the empty mid-gap between symbols and reward text), so it
-    // never overflows the panel's right edge. Off-screen rows are skipped.
+    // Draw the cached priced rows, reading geometry fresh each frame. The price
+    // block is placed just LEFT of the reward label (the empty mid-gap between
+    // symbols and reward text), so it never overflows the panel's right edge.
+    //
+    // Scroll clipping: when the recipe list is long enough to scroll, the game
+    // lays ALL materialized rows out at their true Y offsets and clips them to
+    // the list viewport at render time — scrolled-out rows keep their visible
+    // bit, so geometry is the only displayed-row discriminator. The viewport is
+    // the intersection of the ancestor container rects (recipe list up to the
+    // panel window): whichever ancestor is the real clipper bounds the result,
+    // and a content-sized ancestor rect just contributes a looser bound.
     void DrawRuneshapeOverlay(const PluginSDK::Snapshot& snap) {
         if (m_RuneshapeRows.empty()) return;
+        // Per-frame open/closed gate: rows cached by the 400 ms scan must vanish
+        // the instant the panel closes (the subtree persists, bits cleared).
+        if (m_RuneshapeWindowAddr && !ctx()->Ui.IsVisible(m_RuneshapeWindowAddr)) return;
+
+        float clipX0 = 0.0f, clipY0 = 0.0f;
+        float clipX1 = static_cast<float>(snap.ScreenWidth);
+        float clipY1 = static_cast<float>(snap.ScreenHeight);
+        uintptr_t node = m_RuneshapeListAddr;
+        for (int i = 0; node && i < 8; ++i) {
+            float x, y, w, h;
+            if (ctx()->Ui.ComputeScreenRect(node, x, y, w, h) && w > 1.0f && h > 1.0f) {
+                clipX0 = (std::max)(clipX0, x);
+                clipY0 = (std::max)(clipY0, y);
+                clipX1 = (std::min)(clipX1, x + w);
+                clipY1 = (std::min)(clipY1, y + h);
+            }
+            if (node == m_RuneshapeWindowAddr) break;
+            node = UiParent(node);
+        }
+        if (clipX1 <= clipX0 || clipY1 <= clipY0) return;
+
         ImDrawList* dl = ImGui::GetForegroundDrawList();
         float baseFontSize = ImGui::GetFontSize() * m_TextScale;
 
         for (const auto& r : m_RuneshapeRows) {
-            if (r.y + r.h < 0.0f || r.y > snap.ScreenHeight) continue;
-            if (r.x + r.w < 0.0f || r.x > snap.ScreenWidth)  continue;
+            if (!ctx()->Ui.IsVisible(r.rowAddr)) continue;
+            float x, y, w, h;
+            if (!ctx()->Ui.ComputeScreenRect(r.labelAddr, x, y, w, h)) continue;
+            // A row counts as displayed while its label's center sits inside the
+            // viewport; prices appear/disappear as rows scroll across the edge.
+            const float cx = x + w * 0.5f, cy = y + h * 0.5f;
+            if (cx < clipX0 || cx > clipX1 || cy < clipY0 || cy > clipY1) continue;
 
             // No adaptive shrink: the price draws in the open gap beside the reward
             // text (not inside a tiny cell), so use the full configured size.
@@ -1466,8 +1501,8 @@ private:
             PriceTag tag = MeasurePriceTag(r.total, fontSize);
 
             float gap = fontSize * 0.4f;
-            float labelX = r.x - tag.totalW - gap;
-            float labelY = r.y + (r.h - tag.totalH) * 0.5f;
+            float labelX = x - tag.totalW - gap;
+            float labelY = y + (h - tag.totalH) * 0.5f;
             DrawPriceTag(dl, fontSize, labelX, labelY, tag, r.chaos);
         }
     }
@@ -1736,12 +1771,14 @@ private:
     std::chrono::steady_clock::time_point m_LastRuneshapeDiscover;
     std::chrono::steady_clock::time_point m_LastRuneshapeScan;
 
-    // One priced, positioned reward row. Rebuilt on the 1 Hz scan tick; drawn
-    // each frame. Rect is the reward-label element's screen rect at scan time.
+    // One priced reward row. Rebuilt on the 400 ms scan tick (parse + price
+    // lookup only); geometry is re-read each frame at draw time so prices track
+    // scrolling instantly and clip to the list viewport.
     struct RuneshapeRow {
-        float x = 0, y = 0, w = 0, h = 0;   // reward-label screen rect
-        float total = 0;                     // display-currency value (unit * qty)
-        float chaos = 0;                     // chaos value (unit * qty), for color
+        uintptr_t rowAddr = 0;      // recipe-row element (own visible bit)
+        uintptr_t labelAddr = 0;    // reward-label child (price anchor rect)
+        float total = 0;            // display-currency value (unit * qty)
+        float chaos = 0;            // chaos value (unit * qty), for color
     };
     std::vector<RuneshapeRow> m_RuneshapeRows;
 

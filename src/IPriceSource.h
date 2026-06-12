@@ -8,6 +8,7 @@
 #include <chrono>
 #include <atomic>
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <filesystem>
 
@@ -234,6 +235,26 @@ inline bool IsUniqueCategory(const std::string& category) {
     return false;
 }
 
+// True when `needle` occurs in `hay` as a whole word — both ends on a string
+// edge or a non-alphanumeric character. Plain substring matching is too loose
+// for item names: poe2scout lists Kalandra's Touch with base type "Ring", so
+// the base-type key "ring" is a substring of unrelated names ("Scouring
+// Flame", "Towering Idol") and painted them with a ~19 div price.
+inline bool ContainsWholeWord(const std::string& hay, const std::string& needle) {
+    if (needle.empty() || needle.size() > hay.size()) return false;
+    size_t pos = 0;
+    while ((pos = hay.find(needle, pos)) != std::string::npos) {
+        const bool leftOk = (pos == 0)
+            || !std::isalnum(static_cast<unsigned char>(hay[pos - 1]));
+        const size_t end = pos + needle.size();
+        const bool rightOk = (end == hay.size())
+            || !std::isalnum(static_cast<unsigned char>(hay[end]));
+        if (leftOk && rightOk) return true;
+        ++pos;
+    }
+    return false;
+}
+
 // outMatchKind (optional, diagnostic): 0 = no match, 1 = exact O(1) hashmap hit,
 // 2 = contains-match (the O(N) full-DB substring scan). NinjaPricer's perf panel
 // uses this to count how often the expensive contains path runs per frame.
@@ -248,8 +269,8 @@ inline PriceLookupResult LookupPrice(const PriceDatabase& db, const std::string&
         return MakeResult(db, it->second);
     }
 
-    // 2. Contains match: if the game's display name contains a db key
-    //    e.g. "headhunter heavy belt" contains "headhunter"
+    // 2. Contains match: if the game's display name contains a db key as a
+    //    whole word, e.g. "headhunter heavy belt" contains "headhunter".
     //    Only check unique items (category != "currency") to avoid false positives
     if (key.size() > 3) {
         const PriceItem* bestMatch = nullptr;
@@ -257,7 +278,7 @@ inline PriceLookupResult LookupPrice(const PriceDatabase& db, const std::string&
         for (const auto& [dbKey, item] : db.items) {
             if (item.category == "currency") continue;
             if (dbKey.size() <= bestLen) continue;
-            if (key.find(dbKey) != std::string::npos) {
+            if (ContainsWholeWord(key, dbKey)) {
                 bestMatch = &item;
                 bestLen = dbKey.size();
             }
