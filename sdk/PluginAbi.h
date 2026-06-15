@@ -734,6 +734,9 @@ typedef struct {
                                                PsdkModVisitorFn cb, void* ud);
 } InventoryServiceAbi;
 
+// One UI element's screen rect; ok==0 means the element could not be projected.
+typedef struct { float x, y, w, h; int32_t ok; } PsdkScreenRectAbi;
+
 // Walk the game's UI tree. follow_path indexes child-by-child from a root;
 // the string getters use the query-then-fill convention (buf=NULL for size).
 typedef struct {
@@ -752,6 +755,11 @@ typedef struct {
     uintptr_t (*get_ui_root)(void);
     int32_t (*get_cull_value)(void);
     uintptr_t (*find_panel_by_string_id)(uintptr_t parent, const char* string_id);
+
+    // Batch project: fills out[i] for addrs[0..count). One ABI hop + one SEH
+    // wrap + shared-ancestor memo. APPEND-ONLY: must stay the last member.
+    int32_t (*compute_screen_rects)(const uintptr_t* addrs, int32_t count,
+                                        PsdkScreenRectAbi* out);
 } UiServiceAbi;
 
 // Project coordinates to screen. All return 0 if the point is off-screen / the
