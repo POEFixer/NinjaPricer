@@ -755,11 +755,6 @@ typedef struct {
     uintptr_t (*get_ui_root)(void);
     int32_t (*get_cull_value)(void);
     uintptr_t (*find_panel_by_string_id)(uintptr_t parent, const char* string_id);
-
-    // Batch project: fills out[i] for addrs[0..count). One ABI hop + one SEH
-    // wrap + shared-ancestor memo. APPEND-ONLY: must stay the last member.
-    int32_t (*compute_screen_rects)(const uintptr_t* addrs, int32_t count,
-                                        PsdkScreenRectAbi* out);
 } UiServiceAbi;
 
 // Project coordinates to screen. All return 0 if the point is off-screen / the
@@ -871,6 +866,14 @@ typedef struct HostAbi {
     // at spawn, before any related buff. Append-only tail (2026-06-07).
     void (*enumerate_monster_mods)(uintptr_t omp_addr,
                                    PsdkMonsterModVisitorFn cb, void* ud);
+
+    // Batch-project N UI elements to screen rects in one ABI hop (shared-
+    // ancestor memo). MUST live on the HostAbi tail, NOT inside UiServiceAbi:
+    // services are embedded by value, so growing a mid-struct service shifts
+    // every field after it and breaks already-compiled plugins. Append-only
+    // tail (moved off UiServiceAbi 2026-06-16 to restore that ABI compat).
+    int32_t (*compute_screen_rects)(const uintptr_t* addrs, int32_t count,
+                                    PsdkScreenRectAbi* out);
 } HostAbi;
 
 #ifdef __cplusplus
