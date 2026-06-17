@@ -139,6 +139,8 @@ class LogService;
 class EventsService;
 class OverlayService;
 class FlasksService;
+class PricesService;
+class RuneshapeService;
 class Plugin;
 struct Context;
 
@@ -2251,6 +2253,125 @@ public:
     }
 };
 
+// Item prices from the host PriceService. Reached as ctx()->Prices.
+struct PriceResult { bool found=false; float chaos=0, divine=0, exalt=0; std::string category; };
+struct PriceRates  { float divineInChaos=0, exaltedInChaos=0; };
+struct PriceStatus { bool loaded=false; int totalItems=0;
+                     float divineInChaos=0, exaltedInChaos=0;
+                     int catsOk=0, catsPending=0, catsFailed=0; };
+
+class PricesService {
+    const PricesServiceAbi* m_abi = nullptr;
+    const HostAbi*          m_host = nullptr;
+public:
+    void Init(const PricesServiceAbi* abi, const HostAbi* host) { m_abi = abi; m_host = host; }
+
+    PriceResult LookupPrice(const std::string& name) const {
+        PriceResult r;
+        if (!m_abi || !m_abi->lookup_price) return r;
+        PriceResultAbi a{};
+        if (m_abi->lookup_price(name.c_str(), &a)) {
+            r.found = a.found != 0; r.chaos = a.chaos; r.divine = a.divine; r.exalt = a.exalt;
+            r.category = a.category;
+        }
+        return r;
+    }
+    PriceRates GetRates() const {
+        PriceRates r;
+        if (m_abi && m_abi->get_rates) m_abi->get_rates(&r.divineInChaos, &r.exaltedInChaos);
+        return r;
+    }
+    PriceStatus GetStatus() const {
+        PriceStatus s;
+        if (m_abi && m_abi->get_status) {
+            PriceStatusAbi a{};
+            m_abi->get_status(&a);
+            s.loaded = a.loaded != 0; s.totalItems = a.total_items;
+            s.divineInChaos = a.divine_in_chaos; s.exaltedInChaos = a.exalted_in_chaos;
+            s.catsOk = a.cats_ok; s.catsPending = a.cats_pending; s.catsFailed = a.cats_failed;
+        }
+        return s;
+    }
+};
+
+// One Runeshape device resolved by the host RuneshapeResolver.
+struct Runeshape {
+    uint64_t    entityId    = 0;
+    uint32_t    color       = 0;
+    bool        isUnique    = false;
+    int         holeCount   = 0;
+    std::string anchorName;
+    int         rewardCount = 0;
+    int         bestIndex   = -1;
+};
+
+// One reward slot for a Runeshape device.
+struct RuneshapeReward {
+    std::string name;
+    int         count      = 0;
+    float       unitChaos  = 0.f;
+    float       totalChaos = 0.f;
+    bool        priced     = false;
+};
+
+// Runeshape devices and their per-entity reward lists.
+// Reached as ctx()->Runeshape.
+class RuneshapeService {
+    const RuneshapeServiceAbi* m_abi  = nullptr;
+    const HostAbi*             m_host = nullptr;
+public:
+    void Init(const RuneshapeServiceAbi* abi, const HostAbi* host) {
+        m_abi  = abi;
+        m_host = host;
+    }
+
+    // Collect all resolved Runeshape devices.
+    std::vector<Runeshape> Runeshapes() const {
+        std::vector<Runeshape> out;
+        if (!m_abi || !m_abi->enumerate_runeshapes) return out;
+        struct Ctx { std::vector<Runeshape>* out; };
+        Ctx c{ &out };
+        m_abi->enumerate_runeshapes(
+            [](const RuneshapeAbi* a, void* ud) -> int32_t {
+                auto* p = static_cast<Ctx*>(ud);
+                Runeshape r;
+                r.entityId   = a->entity_id;
+                r.color      = a->color;
+                r.isUnique   = a->is_unique != 0;
+                r.holeCount  = a->hole_count;
+                r.anchorName = a->anchor_name;  // NUL-terminated char buffer
+                r.rewardCount = a->reward_count;
+                r.bestIndex  = a->best_index;
+                p->out->push_back(std::move(r));
+                return 1;
+            },
+            &c);
+        return out;
+    }
+
+    // Collect rewards for a specific Runeshape entity.
+    std::vector<RuneshapeReward> Rewards(uint64_t entityId) const {
+        std::vector<RuneshapeReward> out;
+        if (!m_abi || !m_abi->enumerate_rewards) return out;
+        struct Ctx { std::vector<RuneshapeReward>* out; };
+        Ctx c{ &out };
+        m_abi->enumerate_rewards(entityId,
+            [](const RuneshapeRewardAbi* a, void* ud) -> int32_t {
+                auto* p = static_cast<Ctx*>(ud);
+                RuneshapeReward r;
+                r.name       = a->name;  // NUL-terminated char buffer
+                r.count      = a->count;
+                r.unitChaos  = a->unit_chaos;
+                r.totalChaos = a->total_chaos;
+                r.priced     = a->priced != 0;
+                p->out->push_back(std::move(r));
+                return 1;
+            },
+            &c);
+        return out;
+    }
+};
+
 // Bundles the host services plus the ImGui/D3D handles. Accessed via Plugin::ctx().
 struct Context {
     GameService       Game;
@@ -2265,6 +2386,8 @@ struct Context {
     EventsService     Events;
     OverlayService    Overlay;
     FlasksService     Flasks;
+    PricesService     Prices;
+    RuneshapeService  Runeshape;
     void* ImGuiContext = nullptr;
     void* D3DDevice    = nullptr;
 };
@@ -2371,6 +2494,8 @@ inline void PluginSDK_AttachHost(PluginSDK::Plugin* p,
     p->m_ctx.Events    .Init(&abi->events,     abi);
     p->m_ctx.Overlay   .Init(&abi->overlay,    abi, p);
     p->m_ctx.Flasks    .Init(&abi->flasks,     abi);
+    p->m_ctx.Prices    .Init(&abi->prices,     abi);
+    p->m_ctx.Runeshape .Init(&abi->runeshape,  abi);
     p->m_ctx.ImGuiContext = abi->imgui_context;
     p->m_ctx.D3DDevice    = abi->d3d_device;
 }

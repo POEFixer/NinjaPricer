@@ -827,6 +827,47 @@ typedef struct {
     int32_t (*charm_slot_count)(void);
 } FlasksServiceAbi;
 
+// Item prices from the host PriceService (poe2scout). lookup_price returns 1
+// when the name resolved; out fields are in chaos / divine / exalted units.
+typedef struct { int32_t found; float chaos; float divine; float exalt; char category[32]; } PriceResultAbi;
+typedef struct { int32_t loaded; int32_t total_items; float divine_in_chaos;
+                 float exalted_in_chaos; int32_t cats_ok, cats_pending, cats_failed; } PriceStatusAbi;
+typedef struct {
+    int32_t (*lookup_price)(const char* name, PriceResultAbi* out);
+    void    (*get_rates)(float* divine_in_chaos, float* exalted_in_chaos);
+    void    (*get_status)(PriceStatusAbi* out);
+} PricesServiceAbi;
+
+// Runeshape devices (Expedition2Encounter) resolved by RuneshapeResolver.
+// One reward slot per recipe; reward_count / best_index live in RuneshapeAbi
+// so the visitor can pre-allocate. enumerate_rewards passes rewards for the
+// matching entity_id — call after enumerate_runeshapes per item.
+typedef struct {
+    char    name[48];
+    int32_t count;
+    float   unit_chaos;
+    float   total_chaos;
+    int32_t priced;
+} RuneshapeRewardAbi;
+
+typedef struct {
+    uint64_t entity_id;
+    uint32_t color;
+    int32_t  is_unique;
+    int32_t  hole_count;
+    char     anchor_name[32];
+    int32_t  reward_count;
+    int32_t  best_index;
+} RuneshapeAbi;
+
+typedef int32_t (*PsdkRuneshapeVisitorFn)(const RuneshapeAbi*, void*);
+typedef int32_t (*PsdkRuneshapeRewardVisitorFn)(const RuneshapeRewardAbi*, void*);
+
+typedef struct {
+    void (*enumerate_runeshapes)(PsdkRuneshapeVisitorFn cb, void* ud);
+    void (*enumerate_rewards)(uint64_t entity_id, PsdkRuneshapeRewardVisitorFn cb, void* ud);
+} RuneshapeServiceAbi;
+
 // The root table handed to every plugin. version must equal PLUGIN_SDK_VERSION;
 // trust a field only when size_bytes covers it. Everything below d3d_device is
 // an APPEND-ONLY tail — add new host functions here, never in the middle.
@@ -886,6 +927,13 @@ typedef struct HostAbi {
     // instance stacks differ. Append-only tail (2026-06-16).
     void (*enumerate_buffs_aggregated)(uintptr_t buffs_addr,
                                        PsdkBuffVisitorFn cb, void* ud);
+
+    // Item prices from the host PriceService. Append-only tail (2026-06-17).
+    PricesServiceAbi prices;
+
+    // Runeshape devices (Expedition2Encounter) with per-entity rewards.
+    // Append-only tail (2026-06-17).
+    RuneshapeServiceAbi runeshape;
 } HostAbi;
 
 #ifdef __cplusplus
