@@ -1,8 +1,9 @@
 // ============================================================================
-// NinjaPricer — multi-source price overlay plugin for POE2 (v6 SDK)
+// NinjaPricer — price overlay plugin for POE2 (v6 SDK)
 // ============================================================================
-// Displays item prices from poe.ninja or poe2scout on dropped items and
-// in inventory.
+// Displays item prices from the host PriceService on dropped items and
+// in inventory. All price loading is owned by the host; this plugin only
+// queries ctx()->Prices.
 // ============================================================================
 
 #include "sdk/PluginSDK.h"
@@ -15,35 +16,19 @@
 #define STBI_ONLY_PNG
 #include <stb_image.h>
 
-#include "src/IPriceSource.h"
-#include "src/NinjaSource.h"
-#include "src/ScoutSource.h"
-#include "src/NinjaApi.h"
+#include "lib/nlohmann/json.hpp"
 
 #include <fstream>
 #include <filesystem>
 #include <string>
 #include <chrono>
-#include <thread>
-#include <shared_mutex>
-#include <atomic>
 #include <unordered_map>
 #include <unordered_set>
 #include <map>
 #include <vector>
 #include <algorithm>
-
-using namespace PriceApi;
-
-// Fallback leagues if API fetch fails (current season first).
-// The live list comes from NinjaApi::FetchLeagues(); this is only used when that
-// request fails. Refresh the season entries each league.
-static const char* kFallbackLeagues[] = {
-    "Runes of Aldur",
-    "HC Runes of Aldur",
-    "Standard",
-    "Hardcore",
-};
+#include <cctype>
+#include <cstdio>
 
 // Host-synthesized inventory ID for the Ritual shop ("Favours" window). The
 // host's ScanInventoryGrid publishes the shop grid under this ID (it is not a
@@ -83,6 +68,113 @@ enum class PriceDisplayStyle : int {
 };
 static const char* kPriceDisplayStyleNames[] = { "Image (icon)", "Text" };
 
+// Display currency choice (local to NinjaPricer; not from the deleted headers).
+// Ordinal matches SDK PriceResult fields: 0=Divine, 1=Exalted, 2=Chaos.
+enum class DisplayCurrency : int {
+    Divine  = 0,
+    Exalted = 1,
+    Chaos   = 2,
+};
+
+// ============================================================================
+// Unique category definitions — used by IsUniqueCategory() to gate the
+// Rarity==3 check in the draw paths.
+// ============================================================================
+
+inline constexpr int kMaxUniqueCategories = 7;
+
+struct CategoryDef { const char* apiId; const char* label; };
+
+inline constexpr CategoryDef kUniqueCategories[] = {
+    { "accessory",  "Accessories" },
+    { "armour",     "Armour" },
+    { "flask",      "Flasks" },
+    { "jewel",      "Jewels" },
+    { "map",        "Maps" },
+    { "weapon",     "Weapons" },
+    { "sanctum",    "Sanctum Research" },
+};
+
+// Returns true when `category` belongs to a unique-item category.
+// Used to require Rarity==3 before showing a price that hit via contains-match.
+static bool IsUniqueCategory(const std::string& category) {
+    for (int i = 0; i < kMaxUniqueCategories; i++) {
+        if (category == kUniqueCategories[i].apiId)
+            return true;
+    }
+    return false;
+}
+
+// ============================================================================
+// Local display helpers (moved from deleted IPriceSource.h)
+// ============================================================================
+
+#ifndef IM_COL32
+#define IM_COL32(R,G,B,A) (((unsigned int)(A)<<24) | ((unsigned int)(B)<<16) | ((unsigned int)(G)<<8) | ((unsigned int)(R)))
+#endif
+using ImU32 = unsigned int;
+
+static const char* GetCurrencySuffix(DisplayCurrency c) {
+    switch (c) {
+    case DisplayCurrency::Divine:  return "D";
+    case DisplayCurrency::Exalted: return "E";
+    case DisplayCurrency::Chaos:   return "C";
+    default: return "?";
+    }
+}
+
+static std::string FormatPriceLocal(float value, DisplayCurrency currency) {
+    char buf[32];
+    const char* suffix = GetCurrencySuffix(currency);
+    if (value >= 10000.0f) {
+        float k = value / 1000.0f;
+        if (k >= 10.0f) snprintf(buf, sizeof(buf), "%.0fk %s", k, suffix);
+        else            snprintf(buf, sizeof(buf), "%.1fk %s", k, suffix);
+    } else if (value >= 1000.0f) {
+        snprintf(buf, sizeof(buf), "%.1fk %s", value / 1000.0f, suffix);
+    } else if (value >= 100.0f) {
+        snprintf(buf, sizeof(buf), "%.0f %s", value, suffix);
+    } else if (value >= 1.0f) {
+        snprintf(buf, sizeof(buf), "%.1f %s", value, suffix);
+    } else if (value >= 0.01f) {
+        snprintf(buf, sizeof(buf), "%.2f %s", value, suffix);
+    } else {
+        snprintf(buf, sizeof(buf), "%.3f %s", value, suffix);
+    }
+    return buf;
+}
+
+static std::string FormatPriceNumberLocal(float value) {
+    char buf[32];
+    if (value >= 10000.0f) {
+        float k = value / 1000.0f;
+        if (k >= 10.0f) snprintf(buf, sizeof(buf), "%.0fk", k);
+        else            snprintf(buf, sizeof(buf), "%.1fk", k);
+    } else if (value >= 1000.0f) snprintf(buf, sizeof(buf), "%.1fk", value / 1000.0f);
+    else if (value >= 100.0f)  snprintf(buf, sizeof(buf), "%.0f", value);
+    else if (value >= 1.0f)    snprintf(buf, sizeof(buf), "%.1f", value);
+    else if (value >= 0.01f)   snprintf(buf, sizeof(buf), "%.2f", value);
+    else                       snprintf(buf, sizeof(buf), "%.3f", value);
+    return buf;
+}
+
+static ImU32 GetPriceColorLocal(float chaosValue, float divineInChaos) {
+    float divEquiv = (divineInChaos > 0) ? chaosValue / divineInChaos : 0.0f;
+    if (divEquiv >= 1.0f)  return IM_COL32(255, 215, 0, 255);   // Gold
+    if (divEquiv >= 0.1f)  return IM_COL32(255, 255, 255, 255); // White
+    return IM_COL32(180, 180, 180, 255);                          // Gray
+}
+
+// Extract the display value from a SDK PriceResult for the chosen currency.
+static float GetDisplayValue(const PluginSDK::PriceResult& r, DisplayCurrency c) {
+    switch (c) {
+    case DisplayCurrency::Divine:  return r.divine;
+    case DisplayCurrency::Exalted: return r.exalt;
+    case DisplayCurrency::Chaos:   return r.chaos;
+    default: return r.chaos;
+    }
+}
+
 // Virtual key name helper
 static const char* GetVkName(int vk) {
     if (vk == 0) return "None";
@@ -96,20 +188,9 @@ static const char* GetVkName(int vk) {
     return buf;
 }
 
-// Bridge: PluginSDK::LogService -> PriceApi::LogFunc (C function pointer).
-// The price source threads expect a `void(*)(const char*, const char*)`. The
-// SDK LogService is an object, so we wrap it in a thread-local pointer and
-// expose a free function. Only used during fetch thread lifetime; SetActiveLog
-// is called before StartFetchThread and cleared in StopFetchThread.
-static thread_local const PluginSDK::LogService* tls_logSvc = nullptr;
-static void PriceApiLogBridge(const char* level, const char* msg) {
-    if (tls_logSvc) tls_logSvc->Log(level ? level : "Info", msg ? msg : "");
-}
-
 class NinjaPricerPlugin : public PluginSDK::Plugin {
 public:
     ~NinjaPricerPlugin() override {
-        StopFetchThread();
         ReleaseCurrencyTextures();
     }
 
@@ -124,12 +205,10 @@ public:
         if (ctx()->ImGuiContext)
             ImGui::SetCurrentContext(static_cast<ImGuiContext*>(ctx()->ImGuiContext));
         LoadSettings();
-        StartFetchThread();
         ctx()->Log.Info("[NinjaPricer] Plugin enabled");
     }
 
     void OnDisable() override {
-        StopFetchThread();
         ReleaseCurrencyTextures();
         ctx()->Log.Info("[NinjaPricer] Plugin disabled");
     }
@@ -156,10 +235,6 @@ public:
             DrawTabOverlayToggles();
             ImGui::EndTabItem();
         }
-        if (ImGui::BeginTabItem("Categories")) {
-            DrawTabCategories();
-            ImGui::EndTabItem();
-        }
         if (ImGui::BeginTabItem("Debug")) {
             DrawDebugPanel();
             ImGui::EndTabItem();
@@ -181,60 +256,19 @@ public:
         ImGui::Separator();
         ImGui::Spacing();
 
-        ImGui::Text("Price Source:");
-        int prevSource = m_DataSource;
-        ImGui::RadioButton("poe.ninja", &m_DataSource, 0); ImGui::SameLine();
-        ImGui::RadioButton("poe2scout", &m_DataSource, 1);
-        if (m_DataSource != prevSource)
-            RestartFetchThread();
-
-        ImGui::Spacing();
-
-        ImGui::Text("League:");
-        ImGui::SetNextItemWidth(250.0f);
-
-        const auto& leagues = GetLeagues();
-        if (ImGui::BeginCombo("##League", m_League.c_str())) {
-            for (int i = 0; i < (int)leagues.size(); i++) {
-                bool selected = (m_League == leagues[i]);
-                if (ImGui::Selectable(leagues[i].c_str(), selected)) {
-                    if (m_League != leagues[i]) {
-                        m_League = leagues[i];
-                        RestartFetchThread();
-                    }
-                }
-                if (selected) ImGui::SetItemDefaultFocus();
-            }
-            ImGui::EndCombo();
+        // Read-only status from the host price service.
+        auto st = ctx()->Prices.GetStatus();
+        if (st.loaded) {
+            ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "Prices: loaded");
+        } else {
+            ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, 1.0f), "Prices: loading...");
         }
+        ImGui::Text("Items: %d   (ok %d / pending %d / failed %d)",
+            st.totalItems, st.catsOk, st.catsPending, st.catsFailed);
 
-        ImGui::SameLine();
-        bool loading = m_IsLoading.load();
-        if (loading) {
-            ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, 1.0f), "Loading...");
-        }
-        else {
-            if (ImGui::Button("Refresh Prices"))
-                TriggerRefresh();
-        }
-
-        ImGui::SliderInt("Refresh interval (min)", &m_RefreshIntervalMin, 15, 180);
-
-        ImGui::Spacing();
-
-        {
-            std::shared_lock<std::shared_mutex> lock(m_DbMutex);
-            if (m_PriceDb.loaded) {
-                auto elapsed = std::chrono::steady_clock::now() - m_PriceDb.lastUpdate;
-                auto mins = std::chrono::duration_cast<std::chrono::minutes>(elapsed).count();
-                ImGui::Text("Items loaded: %d | Updated %lld min ago",
-                    m_PriceDb.totalItems, (long long)mins);
-                ImGui::Text("Rates: 1 Divine = %.1f Chaos | 1 Exalted = %.1f Chaos",
-                    m_PriceDb.divineInChaos, m_PriceDb.exaltedInChaos);
-            }
-            else {
-                ImGui::TextDisabled("No price data loaded");
-            }
+        if (st.loaded) {
+            ImGui::Text("Rates: 1 Divine = %.1f Chaos | 1 Exalted = %.1f Chaos",
+                st.divineInChaos, st.exaltedInChaos);
         }
     }
 
@@ -309,6 +343,15 @@ public:
         ImGui::SameLine();
         ImGui::TextDisabled("(price rewards in the Runeshape Combinations panel)");
 
+        ImGui::Checkbox("Runeshape window", &m_ShowRuneshapeWindow);
+        ImGui::SameLine();
+        ImGui::TextDisabled("(movable overlay listing each Runeshape with prices)");
+
+        if (m_ShowRuneshapeWindow) {
+            ImGui::SetNextItemWidth(200.0f);
+            ImGui::SliderFloat("Runeshape window opacity", &m_RuneshapeWinAlpha, 0.1f, 1.0f, "%.2f");
+        }
+
         ImGui::Checkbox("Hide when game not focused", &m_HideWhenUnfocused);
 
         ImGui::Separator();
@@ -347,42 +390,6 @@ public:
         }
     }
 
-    void DrawTabCategories() {
-        ImGui::Spacing();
-
-        float availW = ImGui::GetContentRegionAvail().x;
-        int columns = (availW > 600.0f) ? 4 : (availW > 400.0f) ? 3 : 2;
-
-        ImGui::TextColored(ImVec4(0.6f, 0.8f, 1.0f, 1.0f), "Currency Categories");
-        ImGui::Spacing();
-        if (ImGui::BeginTable("##CurrCats", columns)) {
-            for (int i = 0; i < kMaxCurrencyCategories; i++) {
-                ImGui::TableNextColumn();
-                bool isScoutOnly = (i >= kScoutOnlyCurrencyStart);
-                if (isScoutOnly && m_DataSource == 0) ImGui::BeginDisabled();
-                ImGui::Checkbox(kCurrencyCategories[i].label, &m_CurrencyEnabled[i]);
-                if (isScoutOnly && m_DataSource == 0) ImGui::EndDisabled();
-            }
-            ImGui::EndTable();
-        }
-
-        ImGui::Spacing();
-        ImGui::Separator();
-        ImGui::Spacing();
-
-        ImGui::TextColored(ImVec4(0.6f, 0.8f, 1.0f, 1.0f), "Unique Categories (poe2scout only)");
-        ImGui::Spacing();
-        if (ImGui::BeginTable("##UniqCats", columns)) {
-            for (int i = 0; i < kMaxUniqueCategories; i++) {
-                ImGui::TableNextColumn();
-                if (m_DataSource == 0) ImGui::BeginDisabled();
-                ImGui::Checkbox(kUniqueCategories[i].label, &m_UniqueEnabled[i]);
-                if (m_DataSource == 0) ImGui::EndDisabled();
-            }
-            ImGui::EndTable();
-        }
-    }
-
     // ========================================================================
     // Overlay Rendering
     // ========================================================================
@@ -412,14 +419,16 @@ public:
             m_LastAreaChange = snap.AreaChangeCounter;
         }
 
-        std::shared_lock<std::shared_mutex> lock(m_DbMutex);
-        if (!m_PriceDb.loaded) return;
+        // Gate on the host price service being ready.
+        auto st = ctx()->Prices.GetStatus();
+        if (!st.loaded) return;
 
-        m_CachedDivineInChaos = m_PriceDb.divineInChaos;
+        m_CachedDivineInChaos  = st.divineInChaos;
+        if (st.exaltedInChaos > 0.0f) m_CachedExaltedInChaos = st.exaltedInChaos;
 
         // Reset per-frame perf accumulators (TimedLookup feeds these).
         m_PerfLookupMs = 0.0;
-        m_PerfLookupExact = m_PerfLookupContains = m_PerfLookupMiss = 0;
+        m_PerfLookupExact = m_PerfLookupMiss = 0;
 
         if (m_ShowGroundPrices) {
             double tg0 = PerfNowMs();
@@ -476,8 +485,6 @@ public:
 
         // Finalize per-frame lookup peaks (after all draw paths contributed).
         if (m_PerfLookupMs > m_PerfPeakLookupMs) m_PerfPeakLookupMs = m_PerfLookupMs;
-        if (m_PerfLookupContains > m_PerfPeakLookupContains)
-            m_PerfPeakLookupContains = m_PerfLookupContains;
 
         if (m_ShowRuneshapePrices) {
             auto nowR = std::chrono::steady_clock::now();
@@ -491,6 +498,13 @@ public:
             }
             DrawRuneshapeOverlay(snap);
         }
+
+        if (m_ShowRuneshapeWindow) {
+            DrawRuneshapeWindow();
+        } else {
+            // Release the overlay-input request when the window is off.
+            ctx()->Overlay.SetWantsOverlayInput(false);
+        }
     }
 
     void SaveSettings() override {
@@ -501,8 +515,6 @@ public:
 
         try {
             nlohmann::json j;
-            j["dataSource"] = m_DataSource;
-            j["league"] = m_League;
             j["displayCurrency"] = static_cast<int>(m_DisplayCurrency);
             j["textScale"] = m_TextScale;
             j["showGroundPrices"] = m_ShowGroundPrices;
@@ -510,23 +522,17 @@ public:
             j["showOtherInventoryPrices"] = m_ShowOtherInventoryPrices;
             j["showRitualPrices"] = m_ShowRitualPrices;
             j["showRuneshapePrices"] = m_ShowRuneshapePrices;
-            j["refreshIntervalMin"] = m_RefreshIntervalMin;
+            j["showRuneshapeWindow"] = m_ShowRuneshapeWindow;
+            j["runeshapeWinX"] = m_RuneshapeWinX;
+            j["runeshapeWinY"] = m_RuneshapeWinY;
+            j["runeshapeWinAlpha"] = m_RuneshapeWinAlpha;
+            j["runeshapeWinCollapsed"] = m_RuneshapeWinCollapsed;
             j["hideWhenUnfocused"] = m_HideWhenUnfocused;
             j["hideHotkey"] = m_HideHotkey;
             j["uiPricePosition"] = static_cast<int>(m_UiPricePosition);
             j["groundPricePosition"] = static_cast<int>(m_GroundPricePosition);
             j["priceDisplayStyle"] = static_cast<int>(m_PriceDisplayStyle);
             j["scanIntervalMs"] = m_PerfScanIntervalMs;
-
-            nlohmann::json curr = nlohmann::json::array();
-            for (int i = 0; i < kMaxCurrencyCategories; i++)
-                curr.push_back(m_CurrencyEnabled[i]);
-            j["currencyEnabled"] = curr;
-
-            nlohmann::json uniq = nlohmann::json::array();
-            for (int i = 0; i < kMaxUniqueCategories; i++)
-                uniq.push_back(m_UniqueEnabled[i]);
-            j["uniqueEnabled"] = uniq;
 
             std::ofstream f(configDir / "settings.json");
             if (f.is_open())
@@ -572,16 +578,14 @@ private:
         row("LookupPrice/frame:",  m_PerfLookupMs,   m_PerfPeakLookupMs,   0.5, 3.0);
 
         ImGui::Spacing();
-        ImGui::Text("  LookupPrice this frame: %d exact, %d contains (O(N), peak %d), %d miss",
-            m_PerfLookupExact, m_PerfLookupContains, m_PerfPeakLookupContains, m_PerfLookupMiss);
-        ImGui::Text("  Cached: %d inventories, %d items   |   Price DB: %d entries",
-            m_PerfCachedInvCount, m_PerfCachedItemCount,
-            [this] { std::shared_lock<std::shared_mutex> l(m_DbMutex); return (int)m_PriceDb.items.size(); }());
+        ImGui::Text("  LookupPrice this frame: %d found, %d miss",
+            m_PerfLookupExact, m_PerfLookupMiss);
+        ImGui::Text("  Cached: %d inventories, %d items",
+            m_PerfCachedInvCount, m_PerfCachedItemCount);
 
         if (ImGui::Button("Reset peaks")) {
             m_PerfPeakScanCallMs = m_PerfPeakGetAllMs = m_PerfPeakDrawInvMs = 0.0;
             m_PerfPeakGroundMs = m_PerfPeakLookupMs = 0.0;
-            m_PerfPeakLookupContains = 0;
         }
         ImGui::SameLine();
         ImGui::TextDisabled("Worker-thread scan cost: app Debug -> DataVis -> Inventory Scan");
@@ -594,30 +598,17 @@ private:
     void DrawDebugPanel() {
         PluginSDK::Snapshot snap = ctx()->Game.GetSnapshot();
 
-        ImGui::Text("Source: %s", (m_DataSource == 0) ? "poe.ninja" : "poe2scout");
+        // Price service status
+        auto st = ctx()->Prices.GetStatus();
+        ImGui::TextColored(ImVec4(0.6f, 0.8f, 1.0f, 1.0f), "Price Service (host):");
+        ImGui::Text("  Loaded: %s", st.loaded ? "YES" : "NO");
+        ImGui::Text("  Total items: %d", st.totalItems);
+        ImGui::Text("  DivineInChaos: %.2f", st.divineInChaos);
+        ImGui::Text("  ExaltedInChaos: %.2f", st.exaltedInChaos);
+        ImGui::Text("  Categories: ok=%d / pending=%d / failed=%d",
+            st.catsOk, st.catsPending, st.catsFailed);
 
         DrawPerfSection();
-
-        ImGui::TextColored(ImVec4(0.6f, 0.8f, 1.0f, 1.0f), "Price Database:");
-        {
-            std::shared_lock<std::shared_mutex> lock(m_DbMutex);
-            ImGui::Text("  Loaded: %s", m_PriceDb.loaded ? "YES" : "NO");
-            ImGui::Text("  Total items: %d", m_PriceDb.totalItems);
-            ImGui::Text("  DivineInChaos: %.2f", m_PriceDb.divineInChaos);
-            ImGui::Text("  ExaltedInChaos: %.2f", m_PriceDb.exaltedInChaos);
-            ImGui::Text("  Map size: %d", (int)m_PriceDb.items.size());
-
-            if (m_PriceDb.loaded && ImGui::TreeNode("Sample DB entries (first 10)")) {
-                int count = 0;
-                for (auto& [key, item] : m_PriceDb.items) {
-                    if (count++ >= 10) break;
-                    ImGui::Text("  '%s' -> %.1f chaos (%.4f div)", key.c_str(), item.chaosValue,
-                        (m_PriceDb.divineInChaos > 0)
-                            ? item.chaosValue / m_PriceDb.divineInChaos : 0.0f);
-                }
-                ImGui::TreePop();
-            }
-        }
 
         ImGui::Separator();
 
@@ -653,8 +644,7 @@ private:
                 std::string name = GetGroundLookupName(e);
                 if (name.empty()) name = "(not read yet)";
 
-                std::shared_lock<std::shared_mutex> lock(m_DbMutex);
-                auto price = LookupPrice(m_PriceDb, name);
+                auto price = ctx()->Prices.LookupPrice(name);
 
                 ImGui::Text("  ID:%u Addr:0x%llX Valid:%d",
                     e.Id, (unsigned long long)e.Address, (int)e.IsValid);
@@ -667,7 +657,7 @@ private:
                     sx, sy, vis ? "YES" : "NO");
                 ImGui::Text("    Price found: %s%s", price.found ? "YES" : "NO",
                     price.found
-                    ? (std::string(" -> ") + FormatPrice(
+                    ? (std::string(" -> ") + FormatPriceLocal(
                         GetDisplayValue(price, m_DisplayCurrency), m_DisplayCurrency)).c_str()
                     : "");
                 ImGui::Spacing();
@@ -697,8 +687,7 @@ private:
                 int matchCount = 0;
                 for (const auto& item : inv.Items) {
                     std::string dn = GetItemLookupName(item);
-                    std::shared_lock<std::shared_mutex> lock(m_DbMutex);
-                    auto price = LookupPrice(m_PriceDb, dn);
+                    auto price = ctx()->Prices.LookupPrice(dn);
                     if (price.found) matchCount++;
                 }
                 ImGui::Text("  Items with price match: %d / %d",
@@ -709,15 +698,13 @@ private:
                     for (const auto& item : inv.Items) {
                         if (count++ >= 10) break;
                         std::string dn = GetItemLookupName(item);
-
-                        std::shared_lock<std::shared_mutex> lock(m_DbMutex);
-                        auto price = LookupPrice(m_PriceDb, dn);
+                        auto price = ctx()->Prices.LookupPrice(dn);
 
                         ImGui::Text("  [%d,%d] Lookup:'%s' (stack:%d) path:'%s'",
                             item.SlotX, item.SlotY, dn.c_str(),
                             item.StackCount, item.Path.c_str());
                         ImGui::Text("    Price: %s", price.found
-                            ? FormatPrice(GetDisplayValue(price, m_DisplayCurrency),
+                            ? FormatPriceLocal(GetDisplayValue(price, m_DisplayCurrency),
                                 m_DisplayCurrency).c_str()
                             : "NOT FOUND");
                     }
@@ -754,10 +741,10 @@ private:
             std::string name = GetGroundLookupName(e);
             if (name.empty()) continue;
 
-            PriceLookupResult price = TimedLookup(name);
+            PluginSDK::PriceResult price = TimedLookup(name);
             if (!price.found) continue;
 
-            // Resolve the inner item once; reused for both unique-rarity gate
+            // Resolve the inner item once; reused for both rarity gate
             // and stack multiplier so we never call GetWorldItemInner twice.
             auto inner = ctx()->Entities.GetWorldItemInner(e.Address);
 
@@ -794,7 +781,7 @@ private:
                                tag.totalW, tag.totalH, baseFontSize, blockX, blockY);
 
             DrawPriceTag(dl, baseFontSize, blockX, blockY, tag,
-                         price.chaosValue * stackMultiplier);
+                         price.chaos * stackMultiplier);
         }
     }
 
@@ -814,7 +801,7 @@ private:
             std::string displayName = GetItemLookupName(item);
             if (displayName.empty()) continue;
 
-            PriceLookupResult price = TimedLookup(displayName);
+            PluginSDK::PriceResult price = TimedLookup(displayName);
             if (!price.found) continue;
 
             if (IsUniqueCategory(price.category) && item.Address) {
@@ -861,7 +848,7 @@ private:
             float labelX, labelY;
             CalcUiPricePos(cellX, cellY, cellW, cellH, tag.totalW, tag.totalH, 2.0f, labelX, labelY);
 
-            DrawPriceTag(dl, fontSize, labelX, labelY, tag, price.chaosValue * multiplier);
+            DrawPriceTag(dl, fontSize, labelX, labelY, tag, price.chaos * multiplier);
         }
     }
 
@@ -1004,7 +991,7 @@ private:
             ? GetCurrencyTexture(m_DisplayCurrency) : nullptr;
 
         if (tex) {
-            tag.text = PriceApi::FormatPriceNumber(displayValue);
+            tag.text = FormatPriceNumberLocal(displayValue);
             ImVec2 ts = ImGui::CalcTextSize(tag.text.c_str());
             tag.textW = ts.x * scale;
             tag.textH = ts.y * scale;
@@ -1016,7 +1003,7 @@ private:
             tag.totalW = tag.textW + tag.gap + tag.iconW;
             tag.totalH = tag.iconH;   // icon is the taller element
         } else {
-            tag.text = PriceApi::FormatPrice(displayValue, m_DisplayCurrency);
+            tag.text = FormatPriceLocal(displayValue, m_DisplayCurrency);
             ImVec2 ts = ImGui::CalcTextSize(tag.text.c_str());
             tag.textW = ts.x * scale;
             tag.textH = ts.y * scale;
@@ -1035,7 +1022,7 @@ private:
             ImVec2(x + tag.totalW + pad, y + tag.totalH + pad),
             IM_COL32(0, 0, 0, 200), 2.0f);
 
-        ImU32 col = PriceApi::GetPriceColor(chaosValue, m_CachedDivineInChaos);
+        ImU32 col = GetPriceColorLocal(chaosValue, m_CachedDivineInChaos);
         if (tag.tex) {
             // Value text vertically centered against the (taller) icon.
             float textY = y + (tag.totalH - tag.textH) * 0.5f;
@@ -1107,22 +1094,6 @@ private:
     }
 
     // ========================================================================
-    // League Discovery
-    // ========================================================================
-
-    const std::vector<std::string>& GetLeagues() {
-        if (!m_LeaguesFetched) {
-            m_LeaguesFetched = true;
-            m_Leagues = NinjaApi::FetchLeagues();
-            if (m_Leagues.empty()) {
-                for (const char* name : kFallbackLeagues)
-                    m_Leagues.push_back(name);
-            }
-        }
-        return m_Leagues;
-    }
-
-    // ========================================================================
     // Game Window Focus Check
     // ========================================================================
 
@@ -1135,10 +1106,15 @@ private:
         GetClassNameW(fg, cls, 256);
         if (wcscmp(cls, L"POEWindowClass") == 0 || wcscmp(cls, L"POE2WindowClass") == 0)
             return true;
-        // Our own overlay window (title contains "POEFixer", not localized).
-        wchar_t title[256] = {};
-        GetWindowTextW(fg, title, 256);
-        return wcsstr(title, L"POEFixer") != nullptr;
+        // Our own overlay window: its class AND title are RANDOMIZED per launch
+        // (anti-detection — see main.cpp CreateWindowW with GenerateRandomString),
+        // so title/class matching can't identify it. Match by PROCESS instead —
+        // the overlay HWND belongs to this (the host) process. Without this,
+        // clicking the interactive Runeshape overlay focuses it, the game loses
+        // focus, and this hide-when-unfocused gate hid the whole overlay.
+        DWORD fgPid = 0;
+        GetWindowThreadProcessId(fg, &fgPid);
+        return fgPid == GetCurrentProcessId();
     }
 
     // ========================================================================
@@ -1192,15 +1168,13 @@ private:
 
     // LookupPrice wrapper that accumulates per-frame timing + match-kind counts
     // into the m_Perf* fields. Used by the hot per-frame draw paths (ground +
-    // inventory). The caller must already hold m_DbMutex (DrawUI does).
-    PriceLookupResult TimedLookup(const std::string& name) {
-        int kind = 0;
+    // inventory).
+    PluginSDK::PriceResult TimedLookup(const std::string& name) {
         double t0 = PerfNowMs();
-        PriceLookupResult r = LookupPrice(m_PriceDb, name, &kind);
+        PluginSDK::PriceResult r = ctx()->Prices.LookupPrice(name);
         m_PerfLookupMs += (PerfNowMs() - t0);
-        if (kind == 1)      ++m_PerfLookupExact;
-        else if (kind == 2) ++m_PerfLookupContains;
-        else                ++m_PerfLookupMiss;
+        if (r.found) ++m_PerfLookupExact;
+        else         ++m_PerfLookupMiss;
         return r;
     }
 
@@ -1402,13 +1376,138 @@ private:
     }
 
     // ========================================================================
+    // Runeshape window — movable per-Runeshape overlay (KillCount pattern)
+    // ========================================================================
+
+    // Convert a chaos value to the configured display currency.
+    float ChaosToDisplay(float chaosVal, float divineInChaos, float exaltedInChaos) const {
+        switch (m_DisplayCurrency) {
+        case DisplayCurrency::Divine:
+            return (divineInChaos > 0.0f) ? chaosVal / divineInChaos : 0.0f;
+        case DisplayCurrency::Exalted:
+            return (exaltedInChaos > 0.0f) ? chaosVal / exaltedInChaos : 0.0f;
+        case DisplayCurrency::Chaos:
+        default:
+            return chaosVal;
+        }
+    }
+
+    void DrawRuneshapeWindow() {
+        auto rs = ctx()->Runeshape.Runeshapes();
+
+        bool menuVisible = ctx()->Game.IsMenuVisible();
+
+        // Render only when there's something to show or the menu is open.
+        // While rendered, request interactive overlay input so the title-bar
+        // header can be dragged / collapsed even in pure overlay mode: the host
+        // (radar/render UpdateInput) only lifts WS_EX_TRANSPARENT while the
+        // cursor is over a hit-testable (non-NoInputs) window, and treats a
+        // collapsed window's title bar as hit-testable.
+        const bool render = !(rs.empty() && !menuVisible);
+        ctx()->Overlay.SetWantsOverlayInput(render);
+        if (!render) return;
+
+        // Title bar (drag handle) + collapse arrow are intentionally ENABLED.
+        // No NoInputs/NoMove: interactivity in overlay mode is gated by the host
+        // via the overlay-input request above (clicks still pass through to the
+        // game everywhere except while the cursor is over this window).
+        ImGuiWindowFlags flags = ImGuiWindowFlags_AlwaysAutoResize |
+                                 ImGuiWindowFlags_NoResize |
+                                 ImGuiWindowFlags_NoSavedSettings |
+                                 ImGuiWindowFlags_NoFocusOnAppearing |
+                                 ImGuiWindowFlags_NoScrollbar;
+
+        ImGui::SetNextWindowBgAlpha(m_RuneshapeWinAlpha);
+        ImGui::SetNextWindowPos(ImVec2(m_RuneshapeWinX, m_RuneshapeWinY),
+                                ImGuiCond_Appearing);
+        ImGui::SetNextWindowCollapsed(m_RuneshapeWinCollapsed, ImGuiCond_Appearing);
+
+        // Begin returns false when the window is collapsed — still save pos +
+        // the collapsed state, then bail (the title bar remains interactive).
+        const bool open = ImGui::Begin("Runeshape###RuneshapeWindow", nullptr, flags);
+        m_RuneshapeWinCollapsed = !open;
+        {
+            ImVec2 wp = ImGui::GetWindowPos();
+            if (wp.x != m_RuneshapeWinX || wp.y != m_RuneshapeWinY) {
+                m_RuneshapeWinX = wp.x; m_RuneshapeWinY = wp.y;
+            }
+        }
+        if (!open) {
+            ImGui::End();
+            return;
+        }
+
+        // Fetch rates once for the whole window render.
+        auto rates = ctx()->Prices.GetRates();
+        float divInChaos  = (rates.divineInChaos  > 0.0f) ? rates.divineInChaos  : m_CachedDivineInChaos;
+        float exInChaos   = (rates.exaltedInChaos > 0.0f) ? rates.exaltedInChaos
+                          : (m_CachedExaltedInChaos > 0.0f ? m_CachedExaltedInChaos : 0.0f);
+
+        if (rs.empty()) {
+            ImGui::TextDisabled("No Runeshapes");
+        } else {
+            float baseFontSize = ImGui::GetFontSize() * m_TextScale;
+            const float kSquareSz = baseFontSize * 1.1f;   // small colored square
+
+            for (const auto& r : rs) {
+                auto rewards = ctx()->Runeshape.Rewards(r.entityId);
+
+                // Compute best-reward display price (with bounds guard).
+                std::string bestStr;
+                if (r.bestIndex >= 0 && r.bestIndex < static_cast<int>(rewards.size())) {
+                    float bestChaos   = rewards[r.bestIndex].totalChaos;
+                    float bestDisplay = ChaosToDisplay(bestChaos, divInChaos, exInChaos);
+                    bestStr = FormatPriceLocal(bestDisplay, m_DisplayCurrency);
+                }
+
+                // — colored square —
+                ImDrawList* dl = ImGui::GetWindowDrawList();
+                ImVec2 p = ImGui::GetCursorScreenPos();
+                dl->AddRectFilled(p, ImVec2(p.x + kSquareSz, p.y + kSquareSz),
+                                  static_cast<ImU32>(r.color), 2.0f);
+                ImGui::Dummy(ImVec2(kSquareSz, kSquareSz));
+
+                // — header line —
+                ImGui::SameLine();
+                char header[256];
+                if (!bestStr.empty())
+                    snprintf(header, sizeof(header), "%s  holes:%d  best:%s",
+                             r.anchorName.c_str(), r.holeCount, bestStr.c_str());
+                else
+                    snprintf(header, sizeof(header), "%s  holes:%d",
+                             r.anchorName.c_str(), r.holeCount);
+                ImGui::TextUnformatted(header);
+
+                // — reward rows —
+                if (!rewards.empty()) {
+                    ImGui::Indent(kSquareSz + 4.0f);
+                    for (const auto& rw : rewards) {
+                        if (!rw.priced) continue;
+                        float displayVal = ChaosToDisplay(rw.totalChaos, divInChaos, exInChaos);
+                        std::string priceStr = FormatPriceLocal(displayVal, m_DisplayCurrency);
+                        char row[256];
+                        snprintf(row, sizeof(row), "%s  x%d   %s",
+                                 rw.name.c_str(), rw.count, priceStr.c_str());
+                        ImGui::TextUnformatted(row);
+                    }
+                    ImGui::Unindent(kSquareSz + 4.0f);
+                }
+
+                ImGui::Spacing();
+            }
+        }
+
+        ImGui::End();
+    }
+
+    // ========================================================================
     // Runeshape Combinations overlay — scan + draw
     // ========================================================================
 
-    // Rebuild m_RuneshapeRows from the open panel. Runs on the 400 ms tick under
-    // the m_DbMutex shared_lock (held by DrawUI). Each entry is a priced reward;
-    // geometry is intentionally NOT captured here — rects go stale within one
-    // scroll step, so DrawRuneshapeOverlay re-reads them every frame.
+    // Rebuild m_RuneshapeRows from the open panel. Runs on the 400 ms tick.
+    // Each entry is a priced reward; geometry is intentionally NOT captured here
+    // — rects go stale within one scroll step, so DrawRuneshapeOverlay re-reads
+    // them every frame.
     void ScanRuneshapeRows() {
         m_RuneshapeRows.clear();
         if (!m_ShowRuneshapePrices) return;
@@ -1434,7 +1533,7 @@ private:
             int qty; std::string name;
             if (!ParseReward(text, qty, name)) continue;
 
-            PriceLookupResult price = LookupPrice(m_PriceDb, name);
+            PluginSDK::PriceResult price = ctx()->Prices.LookupPrice(name);
             if (!price.found) continue;
 
             float total = GetDisplayValue(price, m_DisplayCurrency) * qty;
@@ -1444,7 +1543,7 @@ private:
             rr.rowAddr = row;
             rr.labelAddr = label;
             rr.total = total;
-            rr.chaos = price.chaosValue * qty;
+            rr.chaos = price.chaos * qty;
             m_RuneshapeRows.push_back(rr);
         }
     }
@@ -1508,85 +1607,6 @@ private:
     }
 
     // ========================================================================
-    // Fetch Thread
-    // ========================================================================
-
-    void StartFetchThread() {
-        if (m_FetchThread.joinable()) return;
-        m_Running.store(true);
-
-        m_FetchThread = std::thread([this]() {
-            // Make the SDK log service available to PriceApiLogBridge on this thread.
-            tls_logSvc = &ctx()->Log;
-            // Hard exception boundary. A plugin worker thread must NEVER let an
-            // exception escape — that calls std::terminate and kills the entire
-            // host process. A malformed/truncated price-API response makes
-            // nlohmann::json::parse throw parse_error; this is the last-resort
-            // backstop should any inner handler be bypassed.
-            try {
-                while (m_Running.load()) {
-                    {
-                        PriceDatabase tempDb;
-                        IPriceSource& source = (m_DataSource == 0)
-                            ? static_cast<IPriceSource&>(m_NinjaSource)
-                            : static_cast<IPriceSource&>(m_ScoutSource);
-                        source.FetchCategories(
-                            m_League, DirectoryPath(),
-                            m_CurrencyEnabled, m_UniqueEnabled,
-                            tempDb, m_IsLoading, m_Running,
-                            &PriceApiLogBridge);
-
-                        if (m_Running.load()) {
-                            std::unique_lock<std::shared_mutex> lock(m_DbMutex);
-                            m_PriceDb = std::move(tempDb);
-                        }
-                    }
-
-                    for (int i = 0; i < m_RefreshIntervalMin * 60 && m_Running.load(); i++) {
-                        Sleep(1000);
-                        if (m_ForceRefresh.load()) {
-                            m_ForceRefresh.store(false);
-                            break;
-                        }
-                    }
-                }
-            }
-            catch (const std::exception& e) {
-                m_IsLoading.store(false);
-                if (tls_logSvc)
-                    tls_logSvc->Log("Error",
-                        (std::string("[NinjaPricer] fetch thread aborted: ") + e.what()).c_str());
-            }
-            catch (...) {
-                m_IsLoading.store(false);
-                if (tls_logSvc)
-                    tls_logSvc->Log("Error",
-                        "[NinjaPricer] fetch thread aborted: unknown exception");
-            }
-            tls_logSvc = nullptr;
-        });
-    }
-
-    void StopFetchThread() {
-        m_Running.store(false);
-        if (m_FetchThread.joinable())
-            m_FetchThread.join();
-    }
-
-    void TriggerRefresh() {
-        m_ForceRefresh.store(true);
-    }
-
-    void RestartFetchThread() {
-        StopFetchThread();
-        {
-            std::unique_lock<std::shared_mutex> lock(m_DbMutex);
-            m_PriceDb = PriceDatabase{};
-        }
-        StartFetchThread();
-    }
-
-    // ========================================================================
     // Settings Load
     // ========================================================================
 
@@ -1600,15 +1620,6 @@ private:
             if (!f.is_open()) return;
             nlohmann::json j = nlohmann::json::parse(f);
 
-            if (j.contains("dataSource") && j["dataSource"].is_number_integer())
-                m_DataSource = std::clamp(j["dataSource"].get<int>(), 0, 1);
-            if (j.contains("league") && j["league"].is_string())
-                m_League = j["league"].get<std::string>();
-            // League rollover (one-time): bump last season's default to the current
-            // league so existing configs stop pricing against the ended league.
-            // Deliberate choices (Standard / Hardcore / other) are preserved.
-            if (m_League == "Fate of the Vaal")          m_League = "Runes of Aldur";
-            else if (m_League == "HC Fate of the Vaal")  m_League = "HC Runes of Aldur";
             if (j.contains("displayCurrency") && j["displayCurrency"].is_number_integer())
                 m_DisplayCurrency =
                     static_cast<DisplayCurrency>(j["displayCurrency"].get<int>());
@@ -1625,9 +1636,16 @@ private:
                 m_ShowRitualPrices = j["showRitualPrices"].get<bool>();
             if (j.contains("showRuneshapePrices") && j["showRuneshapePrices"].is_boolean())
                 m_ShowRuneshapePrices = j["showRuneshapePrices"].get<bool>();
-            if (j.contains("refreshIntervalMin") &&
-                j["refreshIntervalMin"].is_number_integer())
-                m_RefreshIntervalMin = std::clamp(j["refreshIntervalMin"].get<int>(), 15, 180);
+            if (j.contains("showRuneshapeWindow") && j["showRuneshapeWindow"].is_boolean())
+                m_ShowRuneshapeWindow = j["showRuneshapeWindow"].get<bool>();
+            if (j.contains("runeshapeWinX") && j["runeshapeWinX"].is_number())
+                m_RuneshapeWinX = j["runeshapeWinX"].get<float>();
+            if (j.contains("runeshapeWinY") && j["runeshapeWinY"].is_number())
+                m_RuneshapeWinY = j["runeshapeWinY"].get<float>();
+            if (j.contains("runeshapeWinAlpha") && j["runeshapeWinAlpha"].is_number())
+                m_RuneshapeWinAlpha = std::clamp(j["runeshapeWinAlpha"].get<float>(), 0.1f, 1.0f);
+            if (j.contains("runeshapeWinCollapsed") && j["runeshapeWinCollapsed"].is_boolean())
+                m_RuneshapeWinCollapsed = j["runeshapeWinCollapsed"].get<bool>();
             if (j.contains("hideWhenUnfocused") && j["hideWhenUnfocused"].is_boolean())
                 m_HideWhenUnfocused = j["hideWhenUnfocused"].get<bool>();
             if (j.contains("hideHotkey") && j["hideHotkey"].is_number_integer())
@@ -1644,29 +1662,6 @@ private:
                     std::clamp(j["priceDisplayStyle"].get<int>(), 0, 1));
             if (j.contains("scanIntervalMs") && j["scanIntervalMs"].is_number_integer())
                 m_PerfScanIntervalMs = std::clamp(j["scanIntervalMs"].get<int>(), 50, 2000);
-
-            if (j.contains("currencyEnabled") && j["currencyEnabled"].is_array()) {
-                auto& arr = j["currencyEnabled"];
-                for (int i = 0; i < kMaxCurrencyCategories && i < (int)arr.size(); i++) {
-                    if (arr[i].is_boolean())
-                        m_CurrencyEnabled[i] = arr[i].get<bool>();
-                }
-            }
-            else if (j.contains("categoryEnabled") && j["categoryEnabled"].is_array()) {
-                auto& cats = j["categoryEnabled"];
-                for (int i = 0; i < 13 && i < (int)cats.size(); i++) {
-                    if (cats[i].is_boolean())
-                        m_CurrencyEnabled[i] = cats[i].get<bool>();
-                }
-            }
-
-            if (j.contains("uniqueEnabled") && j["uniqueEnabled"].is_array()) {
-                auto& arr = j["uniqueEnabled"];
-                for (int i = 0; i < kMaxUniqueCategories && i < (int)arr.size(); i++) {
-                    if (arr[i].is_boolean())
-                        m_UniqueEnabled[i] = arr[i].get<bool>();
-                }
-            }
         }
         catch (...) {
             ctx()->Log.Warn("[NinjaPricer] Failed to load settings, using defaults");
@@ -1677,7 +1672,6 @@ private:
     // Members
     // ========================================================================
 
-    std::string m_League = "Runes of Aldur";
     DisplayCurrency m_DisplayCurrency = DisplayCurrency::Divine;
     PriceDisplayStyle m_PriceDisplayStyle = PriceDisplayStyle::Image;  // default: icon
     float m_TextScale = 1.0f;
@@ -1686,47 +1680,27 @@ private:
     bool m_ShowOtherInventoryPrices = false;  // Off by default — minor frame-time impact
     bool m_ShowRitualPrices = true;           // On by default — Ritual "Favours" shop pricing
     bool m_ShowRuneshapePrices = true;        // On by default — Runeshape Combinations reward pricing
-    int m_RefreshIntervalMin = 60;            // 60-min refresh - lighter on poe.ninja / poe2scout
     bool m_HideWhenUnfocused = true;
     int m_HideHotkey = 0;
     UiPricePosition m_UiPricePosition = UiPricePosition::BottomRight;
     GroundPricePosition m_GroundPricePosition = GroundPricePosition::Top;
-    int m_DataSource = 1;
-    bool m_CurrencyEnabled[kMaxCurrencyCategories] = {
-        true, true, true, true, true, true, true, true,
-        true, true, true, true, true, true, true, true,
-        true
-    };
-    bool m_UniqueEnabled[kMaxUniqueCategories] = {
-        true, true, true, true, true, true, true
-    };
 
-    // Price data
-    PriceDatabase m_PriceDb;
-    std::shared_mutex m_DbMutex;
-    std::atomic<bool> m_IsLoading{ false };
-    float m_CachedDivineInChaos = 1.0f;
-
-    // Price source instances
-    NinjaSource m_NinjaSource;
-    ScoutSource m_ScoutSource;
-
-    // Fetch thread
-    std::thread m_FetchThread;
-    std::atomic<bool> m_Running{ false };
-    std::atomic<bool> m_ForceRefresh{ false };
+    // Cached divine rate (for color thresholds in GetPriceColorLocal).
+    float m_CachedDivineInChaos   = 1.0f;
+    // Cached exalted rate — warm fallback when GetRates() returns 0 between fetches.
+    float m_CachedExaltedInChaos  = 0.0f;
 
     // Runtime caches
     std::unordered_map<uint32_t, std::string> m_NameCache;
     uint64_t m_LastAreaChange = 0;
     std::chrono::steady_clock::time_point m_LastInventoryScan;
 
-    // Inventory data cache — refreshed once per Scan tick (1 Hz). Avoids
+    // Inventory data cache — refreshed once per Scan tick. Avoids
     // 60-FPS bridge round-trips through Inventory.GetAll() + per-item
     // FetchString. Cleared on area change and on every scan refresh.
     std::vector<PluginSDK::Inventory> m_CachedInventories;
 
-    // Per-item rarity cache for the unique-category gate. Keyed by
+    // Per-item rarity cache for the high-value unique gate. Keyed by
     // InventoryItem::Address, cleared alongside m_CachedInventories.
     std::unordered_map<uintptr_t, int> m_RarityCache;
 
@@ -1738,7 +1712,7 @@ private:
     //   GetAll()   : ABI marshaling of every inventory/item across the bridge
     //   DrawInv    : per-frame inventory overlay (incl. LookupPrice)
     //   Ground     : per-frame ground-item overlay (incl. LookupPrice + ABI)
-    //   Lookup     : time + count of LookupPrice, split exact vs O(N) contains
+    //   Lookup     : time + count of LookupPrice
     // m_PerfScanIntervalMs is the (tunable) inventory refresh throttle. With the
     // decoupled read below, perceived latency ≈ interval + one worker cycle, so a
     // modest default already feels instant. kInvReadDelayMs is how long after the
@@ -1757,11 +1731,16 @@ private:
     double m_PerfPeakGroundMs = 0.0;
     double m_PerfPeakLookupMs = 0.0;
     int    m_PerfLookupExact = 0;         // per-frame counts (reset each DrawUI)
-    int    m_PerfLookupContains = 0;
     int    m_PerfLookupMiss = 0;
-    int    m_PerfPeakLookupContains = 0;
     int    m_PerfCachedInvCount = 0;
     int    m_PerfCachedItemCount = 0;
+
+    // ---- Runeshape movable window ----
+    bool  m_ShowRuneshapeWindow = true;
+    float m_RuneshapeWinX = 100.0f;
+    float m_RuneshapeWinY = 100.0f;
+    float m_RuneshapeWinAlpha = 0.85f;
+    bool  m_RuneshapeWinCollapsed = false;   // persisted collapse state of the window
 
     // ---- Runeshape Combinations overlay ----
     // Cached row-list container of the open "Runeshape Combinations" panel
@@ -1781,10 +1760,6 @@ private:
         float chaos = 0;            // chaos value (unit * qty), for color
     };
     std::vector<RuneshapeRow> m_RuneshapeRows;
-
-    // League cache
-    std::vector<std::string> m_Leagues;
-    bool m_LeaguesFetched = false;
 
     // UI state
     bool m_CapturingHotkey = false;

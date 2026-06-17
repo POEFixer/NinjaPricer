@@ -93,10 +93,6 @@
   <ItemGroup>
     <ClInclude Include="sdk\PluginAbi.h" />
     <ClInclude Include="sdk\PluginSDK.h" />
-    <ClInclude Include="src\IPriceSource.h" />
-    <ClInclude Include="src\NinjaApi.h" />
-    <ClInclude Include="src\NinjaSource.h" />
-    <ClInclude Include="src\ScoutSource.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
