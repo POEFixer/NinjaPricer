@@ -934,6 +934,38 @@ typedef struct HostAbi {
     // Runeshape devices (Expedition2Encounter) with per-entity rewards.
     // Append-only tail (2026-06-17).
     RuneshapeServiceAbi runeshape;
+
+    // Resolve an item name to its host-cached icon PNG path (absolute UTF-8) in a
+    // PLUGIN-OWNED buffer. Returns 1 + writes a NUL-terminated path when an icon is
+    // cached, else 0. Append-only tail (2026-06-18). NEVER add this to PriceResultAbi
+    // (that struct is filled into a plugin buffer — growing it overruns old plugins).
+    int32_t (*lookup_price_icon)(const char* name, char* out_path, int32_t out_path_size);
+
+    // Character gold counter — the amount shown on the in-game inventory gold
+    // display. Returns the current gold, or 0 when not in game / unavailable.
+    // Sourced from the host's ServerData snapshot. Append-only tail (2026-06-24).
+    int32_t (*get_gold)(void);
+
+    // Format a stat key + value(s) into in-game-style text using the host's .csd
+    // stat-description set (the same formatting the Debug panel uses). Writes a
+    // NUL-terminated UTF-8 string into `out` (truncated to out_size); returns the
+    // length written (excl. NUL), or 0 if unavailable. Append-only tail
+    // (2026-06-24, after get_gold).
+    int32_t (*format_stat_description)(const char* stat_key, float v0, float v1,
+                                       char* out, int32_t out_size);
+
+    // Read an inventory item's base defensive values into out4 = {armour,
+    // evasion, energy_shield, ward}. Returns 1 if the item has an Armour
+    // component (out4 always written, zeroed when absent), else 0. Append-only
+    // tail (2026-06-24).
+    int32_t (*read_item_base_stats)(uintptr_t entity_addr, int32_t* out4);
+
+    // Read an item's aggregated stats (StatsFromMods) as flat {id,value} pairs
+    // into out_pairs (capacity 2*max_pairs ints). Returns the TOTAL pair count
+    // (may exceed max_pairs; only max_pairs are written). Append-only tail
+    // (2026-06-24).
+    int32_t (*read_item_aggregated_stats)(uintptr_t entity_addr, int32_t* out_pairs,
+                                          int32_t max_pairs);
 } HostAbi;
 
 #ifdef __cplusplus

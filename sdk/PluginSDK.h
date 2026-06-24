@@ -1220,6 +1220,12 @@ public:
         if (m_abi && m_abi->get_screen_size) m_abi->get_screen_size(&s.Width, &s.Height);
         return s;
     }
+
+    // Character gold counter (the inventory gold amount). 0 when not in game.
+    // Sourced from the host's ServerData snapshot via the HostAbi tail.
+    int GetGold() const {
+        return (m_host && m_host->get_gold) ? m_host->get_gold() : 0;
+    }
 };
 
 // Enumerate / look up entities; Watch() keeps a component map fresh across
@@ -1615,6 +1621,12 @@ public:
 };
 
 // Inventories, their items, and item-detail lookups. Reached as ctx()->Inventory.
+// Item base defensive values (base, not the computed tooltip total).
+struct ItemBaseStats {
+    bool Valid = false;
+    int Armour = 0, Evasion = 0, EnergyShield = 0, Ward = 0;
+};
+
 class InventoryService {
     const InventoryServiceAbi* m_abi = nullptr;
     const HostAbi*          m_host = nullptr;
@@ -1760,6 +1772,41 @@ public:
                 &c);
         }
         return im;
+    }
+
+    // In-game-style text for a stat key + value(s) via the host .csd formatter
+    // (the same formatting the Debug panel uses). Empty if unavailable.
+    std::string FormatStat(const std::string& statKey, float v0, float v1 = 0.0f) const {
+        if (!m_host || !m_host->format_stat_description) return {};
+        char buf[256];
+        int32_t n = m_host->format_stat_description(statKey.c_str(), v0, v1, buf,
+                                                    static_cast<int32_t>(sizeof(buf)));
+        return (n > 0) ? std::string(buf, static_cast<size_t>(n)) : std::string();
+    }
+
+    // Base defensive values for an item (base, not the computed tooltip total).
+    ItemBaseStats ReadItemBaseStats(uintptr_t entityAddr) const {
+        ItemBaseStats r;
+        if (!m_host || !m_host->read_item_base_stats) return r;
+        int32_t v[4] = { 0, 0, 0, 0 };
+        if (m_host->read_item_base_stats(entityAddr, v)) {
+            r.Valid = true;
+            r.Armour = v[0]; r.Evasion = v[1]; r.EnergyShield = v[2]; r.Ward = v[3];
+        }
+        return r;
+    }
+
+    // Aggregated stats (StatsFromMods) as {statId, value} pairs (waystone
+    // Item Rarity/Pack Size/etc. + every aggregated stat).
+    std::vector<std::pair<int, int>> ReadItemAggregatedStats(uintptr_t entityAddr) const {
+        std::vector<std::pair<int, int>> out;
+        if (!m_host || !m_host->read_item_aggregated_stats) return out;
+        int32_t buf[128];
+        int32_t count = m_host->read_item_aggregated_stats(entityAddr, buf, 64);
+        int32_t n = (count < 64) ? count : 64;
+        for (int32_t i = 0; i < n; ++i)
+            out.emplace_back(buf[2 * i], buf[2 * i + 1]);
+        return out;
     }
 };
 
@@ -2254,7 +2301,7 @@ public:
 };
 
 // Item prices from the host PriceService. Reached as ctx()->Prices.
-struct PriceResult { bool found=false; float chaos=0, divine=0, exalt=0; std::string category; };
+struct PriceResult { bool found=false; float chaos=0, divine=0, exalt=0; std::string category; std::string iconPath; };
 struct PriceRates  { float divineInChaos=0, exaltedInChaos=0; };
 struct PriceStatus { bool loaded=false; int totalItems=0;
                      float divineInChaos=0, exaltedInChaos=0;
@@ -2273,6 +2320,11 @@ public:
         if (m_abi->lookup_price(name.c_str(), &a)) {
             r.found = a.found != 0; r.chaos = a.chaos; r.divine = a.divine; r.exalt = a.exalt;
             r.category = a.category;
+            if (m_host && m_host->lookup_price_icon) {
+                char ip[260] = {};
+                if (m_host->lookup_price_icon(name.c_str(), ip, (int32_t)sizeof(ip)))
+                    r.iconPath = ip;
+            }
         }
         return r;
     }
