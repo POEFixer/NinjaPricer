@@ -848,6 +848,11 @@ typedef struct {
     float   unit_chaos;
     float   total_chaos;
     int32_t priced;
+    // --- APPEND-ONLY (rune propagation, 0.5.4). Passed by const ptr per visitor
+    //     callback, so older plugins safely read only the prefix above. ---
+    char    propagating_runes[64];  // rune(s) at this recipe's propagating slot(s); "" if none
+    int32_t propagating_count;      // number of propagating runes for this reward
+    int32_t propagating_has_rare;   // 1 if any propagating rune is rare (idx 23-32)
 } RuneshapeRewardAbi;
 
 typedef struct {
@@ -858,6 +863,9 @@ typedef struct {
     char     anchor_name[32];
     int32_t  reward_count;
     int32_t  best_index;
+    // --- APPEND-ONLY (rune propagation, 0.5.4) ---
+    int32_t  propagating_slots[4];   // raw propagating slot indices; unused entries = -1
+    int32_t  propagating_slot_count; // number of valid entries in propagating_slots (0..4)
 } RuneshapeAbi;
 
 typedef int32_t (*PsdkRuneshapeVisitorFn)(const RuneshapeAbi*, void*);

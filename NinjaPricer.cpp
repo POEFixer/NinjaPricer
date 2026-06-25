@@ -28,6 +28,8 @@
 #include <vector>
 #include <algorithm>
 #include <cctype>
+#include <cmath>
+#include <cstdint>
 #include <cstdio>
 
 // Host-synthesized inventory ID for the Ritual shop ("Favours" window). The
@@ -258,13 +260,7 @@ public:
 
         // Read-only status from the host price service.
         auto st = ctx()->Prices.GetStatus();
-        if (st.loaded) {
-            ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "Prices: loaded");
-        } else {
-            ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, 1.0f), "Prices: loading...");
-        }
-        ImGui::Text("Items: %d   (ok %d / pending %d / failed %d)",
-            st.totalItems, st.catsOk, st.catsPending, st.catsFailed);
+        ImGui::Text("Prices: %s   Items: %d", st.loaded ? "loaded" : "loading...", st.totalItems);
 
         if (st.loaded) {
             ImGui::Text("Rates: 1 Divine = %.1f Chaos | 1 Exalted = %.1f Chaos",
@@ -351,6 +347,8 @@ public:
             ImGui::SetNextItemWidth(200.0f);
             ImGui::SliderFloat("Runeshape window opacity", &m_RuneshapeWinAlpha, 0.1f, 1.0f, "%.2f");
         }
+
+        ImGui::Checkbox("Show item icons", &m_ShowItemIcons);
 
         ImGui::Checkbox("Hide when game not focused", &m_HideWhenUnfocused);
 
@@ -522,11 +520,13 @@ public:
             j["showOtherInventoryPrices"] = m_ShowOtherInventoryPrices;
             j["showRitualPrices"] = m_ShowRitualPrices;
             j["showRuneshapePrices"] = m_ShowRuneshapePrices;
+            j["showItemIcons"] = m_ShowItemIcons;
             j["showRuneshapeWindow"] = m_ShowRuneshapeWindow;
             j["runeshapeWinX"] = m_RuneshapeWinX;
             j["runeshapeWinY"] = m_RuneshapeWinY;
             j["runeshapeWinAlpha"] = m_RuneshapeWinAlpha;
             j["runeshapeWinCollapsed"] = m_RuneshapeWinCollapsed;
+            { nlohmann::json arr = nlohmann::json::array(); for (auto c : m_RuneshapeCollapsed) arr.push_back(c); j["runeshapeCollapsed"] = arr; }
             j["hideWhenUnfocused"] = m_HideWhenUnfocused;
             j["hideHotkey"] = m_HideHotkey;
             j["uiPricePosition"] = static_cast<int>(m_UiPricePosition);
@@ -772,7 +772,8 @@ private:
             if (!ctx()->Render.WorldToScreen(e.WorldX, e.WorldY, e.WorldZ, sx, sy))
                 continue;
 
-            PriceTag tag = MeasurePriceTag(displayValue, baseFontSize);
+            PriceTag tag = MeasurePriceTag(displayValue, baseFontSize,
+                m_ShowItemIcons ? price.iconPath : std::string());
 
             // Anchor is a single screen point (zero-sized box). CalcGroundPricePos
             // already centres the block around (sx, sy) with the four presets.
@@ -843,7 +844,8 @@ private:
 
             float fontSize = ComputeAdaptiveFontSize(baseFontSize, cellW, cellH);
 
-            PriceTag tag = MeasurePriceTag(displayValue, fontSize);
+            PriceTag tag = MeasurePriceTag(displayValue, fontSize,
+                m_ShowItemIcons ? price.iconPath : std::string(), cellW - 4.0f);
 
             float labelX, labelY;
             CalcUiPricePos(cellX, cellY, cellW, cellH, tag.totalW, tag.totalH, 2.0f, labelX, labelY);
@@ -895,6 +897,8 @@ private:
         const CurrencyTex* tex = nullptr;   // null => render text only
         float iconW = 0.0f, iconH = 0.0f, gap = 0.0f;
         float totalW = 0.0f, totalH = 0.0f;
+        const CurrencyTex* itemTex = nullptr;   // item icon (left of everything); null => none
+        float itemIconW = 0.0f, itemIconH = 0.0f, itemGap = 0.0f;
     };
 
     static constexpr float kIconHeightMul = 1.4f;   // icon height vs text line height
@@ -976,13 +980,62 @@ private:
             m_CurrencyTex[i] = CurrencyTex{};
             m_CurrencyTexTried[i] = false;
         }
+        for (auto& kv : m_ItemTex) if (kv.second.srv) kv.second.srv->Release();
+        m_ItemTex.clear();
+    }
+
+    // Path-keyed cache of item icons loaded from PriceIconCache PNGs.
+    std::unordered_map<std::string, CurrencyTex> m_ItemTex;   // key = absolute UTF-8 path
+
+    const CurrencyTex* GetItemTexture(const std::string& path) {
+        if (path.empty()) return nullptr;
+        auto it = m_ItemTex.find(path);
+        if (it != m_ItemTex.end()) return it->second.valid ? &it->second : nullptr;
+        CurrencyTex t{};   // default-invalid; inserted even on failure so we don't retry every frame
+        auto* device = static_cast<ID3D11Device*>(ctx()->D3DDevice);
+        if (device) {
+            // UTF-8 path -> wide for Unicode-safe open (install dir may be non-ASCII).
+            int wn = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
+            std::wstring wp(wn > 0 ? wn - 1 : 0, L'\0');
+            if (wn > 0) MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, wp.data(), wn);
+            std::ifstream f(wp, std::ios::binary);
+            if (f.is_open()) {
+                std::vector<unsigned char> bytes((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+                int w = 0, h = 0;
+                unsigned char* data = bytes.empty() ? nullptr
+                    : stbi_load_from_memory(bytes.data(), (int)bytes.size(), &w, &h, nullptr, 4);
+                if (data) {
+                    D3D11_TEXTURE2D_DESC desc = {};
+                    desc.Width=(UINT)w; desc.Height=(UINT)h; desc.MipLevels=1; desc.ArraySize=1;
+                    desc.Format=DXGI_FORMAT_R8G8B8A8_UNORM; desc.SampleDesc.Count=1;
+                    desc.Usage=D3D11_USAGE_DEFAULT; desc.BindFlags=D3D11_BIND_SHADER_RESOURCE;
+                    D3D11_SUBRESOURCE_DATA init = {}; init.pSysMem=data; init.SysMemPitch=(UINT)(w*4);
+                    ID3D11Texture2D* tex=nullptr;
+                    if (SUCCEEDED(device->CreateTexture2D(&desc,&init,&tex)) && tex) {
+                        ID3D11ShaderResourceView* srv=nullptr;
+                        D3D11_SHADER_RESOURCE_VIEW_DESC sd={}; sd.Format=desc.Format;
+                        sd.ViewDimension=D3D11_SRV_DIMENSION_TEXTURE2D; sd.Texture2D.MipLevels=1;
+                        if (SUCCEEDED(device->CreateShaderResourceView(tex,&sd,&srv)) && srv) {
+                            t.srv=srv; t.id=reinterpret_cast<ImTextureID>(srv); t.w=w; t.h=h; t.valid=true;
+                        }
+                        tex->Release();
+                    }
+                    stbi_image_free(data);
+                }
+            }
+        }
+        auto& slot = m_ItemTex.emplace(path, t).first->second;
+        return slot.valid ? &slot : nullptr;
     }
 
     // ---- Price label measure + draw ----------------------------------------
 
     // Measure a price label at the given font size, honoring the display style.
     // Falls back to text when the icon texture is unavailable (missing PNG / no device).
-    PriceTag MeasurePriceTag(float displayValue, float fontSize) {
+    // iconPath: optional item icon to prepend at the far left (clamped by maxWidth).
+    // maxWidth: when > 0, the item icon is dropped if adding it would exceed this width.
+    PriceTag MeasurePriceTag(float displayValue, float fontSize,
+                             const std::string& iconPath = "", float maxWidth = 0.0f) {
         PriceTag tag;
         float ref = ImGui::GetFontSize();
         float scale = (ref > 0.0f) ? (fontSize / ref) : 1.0f;
@@ -1010,6 +1063,23 @@ private:
             tag.totalW = tag.textW;
             tag.totalH = tag.textH;
         }
+
+        // Prepend the item icon if available and it fits (maxWidth<=0 => no cap).
+        if (!iconPath.empty()) {
+            const CurrencyTex* itex = GetItemTexture(iconPath);
+            if (itex) {
+                float ih = tag.totalH;                         // match the block height
+                float aspect = (itex->h > 0) ? ((float)itex->w / itex->h) : 1.0f;
+                float iw = ih * aspect;
+                float ig = fontSize * 0.15f;
+                float candidate = iw + ig + tag.totalW;
+                if (maxWidth <= 0.0f || candidate <= maxWidth) {
+                    tag.itemTex = itex; tag.itemIconW = iw; tag.itemIconH = ih; tag.itemGap = ig;
+                    tag.totalW = candidate;
+                }
+            }
+        }
+
         return tag;
     }
 
@@ -1022,17 +1092,25 @@ private:
             ImVec2(x + tag.totalW + pad, y + tag.totalH + pad),
             IM_COL32(0, 0, 0, 200), 2.0f);
 
+        float cursorX = x;
+        if (tag.itemTex) {
+            float iy = y + (tag.totalH - tag.itemIconH) * 0.5f;
+            dl->AddImage(tag.itemTex->id, ImVec2(cursorX, iy),
+                ImVec2(cursorX + tag.itemIconW, iy + tag.itemIconH));
+            cursorX += tag.itemIconW + tag.itemGap;
+        }
+
         ImU32 col = GetPriceColorLocal(chaosValue, m_CachedDivineInChaos);
         if (tag.tex) {
-            // Value text vertically centered against the (taller) icon.
             float textY = y + (tag.totalH - tag.textH) * 0.5f;
-            dl->AddText(ImGui::GetFont(), fontSize, ImVec2(x, textY), col, tag.text.c_str());
-            float iconX = x + tag.textW + tag.gap;
+            dl->AddText(ImGui::GetFont(), fontSize, ImVec2(cursorX, textY), col, tag.text.c_str());
+            float iconX = cursorX + tag.textW + tag.gap;
             float iconY = y + (tag.totalH - tag.iconH) * 0.5f;
             dl->AddImage(tag.tex->id, ImVec2(iconX, iconY),
                 ImVec2(iconX + tag.iconW, iconY + tag.iconH));
         } else {
-            dl->AddText(ImGui::GetFont(), fontSize, ImVec2(x, y), col, tag.text.c_str());
+            float textY = tag.itemTex ? (y + (tag.totalH - tag.textH) * 0.5f) : y;
+            dl->AddText(ImGui::GetFont(), fontSize, ImVec2(cursorX, textY), col, tag.text.c_str());
         }
     }
 
@@ -1452,43 +1530,149 @@ private:
             for (const auto& r : rs) {
                 auto rewards = ctx()->Runeshape.Rewards(r.entityId);
 
-                // Compute best-reward display price (with bounds guard).
-                std::string bestStr;
-                if (r.bestIndex >= 0 && r.bestIndex < static_cast<int>(rewards.size())) {
-                    float bestChaos   = rewards[r.bestIndex].totalChaos;
-                    float bestDisplay = ChaosToDisplay(bestChaos, divInChaos, exInChaos);
-                    bestStr = FormatPriceLocal(bestDisplay, m_DisplayCurrency);
+                // — measure holes dots + best price (currency icon + number) so the
+                //   auto-resize header reserves room; both are drawn on the header's
+                //   right side as decorations (keeps the inline look). —
+                const float lineH = ImGui::GetTextLineHeight();
+                const float dotR  = lineH * 0.18f;
+                const float dotStride = dotR * 2.0f + 4.0f;
+                const float dotsW = (r.holeCount > 0) ? (r.holeCount * dotStride) : 0.0f;
+
+                bool  bestPriced = (r.bestIndex >= 0 &&
+                                    r.bestIndex < static_cast<int>(rewards.size()) &&
+                                    rewards[r.bestIndex].priced);
+                float bestDisplay = 0.0f;
+                const CurrencyTex* ctex = nullptr;
+                std::string bestNum, bestText;   // bestNum (icon path) OR bestText (fallback, has suffix)
+                float priceW = 0.0f;
+                if (bestPriced) {
+                    bestDisplay = ChaosToDisplay(rewards[r.bestIndex].totalChaos, divInChaos, exInChaos);
+                    ctex = GetCurrencyTexture(m_DisplayCurrency);
+                    if (ctex && ctex->valid) {
+                        bestNum = FormatPriceNumberLocal(bestDisplay);
+                        const float iw = lineH * (ctex->h ? static_cast<float>(ctex->w) / static_cast<float>(ctex->h) : 1.0f);
+                        priceW = iw + 4.0f + ImGui::CalcTextSize(bestNum.c_str()).x;
+                    } else {
+                        bestText = FormatPriceLocal(bestDisplay, m_DisplayCurrency);
+                        priceW = ImGui::CalcTextSize(bestText.c_str()).x;
+                    }
                 }
 
-                // — colored square —
+                // Reserve space in the header label (auto-resize window) so the
+                // right-side decorations never overlap the anchor name.
+                const float reserve = dotsW + (priceW > 0.0f ? priceW + 10.0f : 0.0f) + 16.0f;
+                const float spaceW  = ImGui::CalcTextSize(" ").x;
+                const int   padCnt  = (spaceW > 0.0f) ? static_cast<int>(ceilf(reserve / spaceW)) : 0;
+
+                // — colored square (vertically centered on the framed header) —
                 ImDrawList* dl = ImGui::GetWindowDrawList();
+                const float frameH = ImGui::GetFrameHeight();
+                const float sqYOff = (frameH > kSquareSz) ? (frameH - kSquareSz) * 0.5f : 0.0f;
                 ImVec2 p = ImGui::GetCursorScreenPos();
-                dl->AddRectFilled(p, ImVec2(p.x + kSquareSz, p.y + kSquareSz),
+                dl->AddRectFilled(ImVec2(p.x, p.y + sqYOff),
+                                  ImVec2(p.x + kSquareSz, p.y + sqYOff + kSquareSz),
                                   static_cast<ImU32>(r.color), 2.0f);
-                ImGui::Dummy(ImVec2(kSquareSz, kSquareSz));
-
-                // — header line —
+                ImGui::Dummy(ImVec2(kSquareSz, frameH));
                 ImGui::SameLine();
-                char header[256];
-                if (!bestStr.empty())
-                    snprintf(header, sizeof(header), "%s  holes:%d  best:%s",
-                             r.anchorName.c_str(), r.holeCount, bestStr.c_str());
-                else
-                    snprintf(header, sizeof(header), "%s  holes:%d",
-                             r.anchorName.c_str(), r.holeCount);
-                ImGui::TextUnformatted(header);
 
-                // — reward rows —
-                if (!rewards.empty()) {
+                // — collapsible header (per-Runeshape; ###id keyed by color so the
+                //   collapsed state persists across maps and sessions) —
+                const bool wantOpen = (m_RuneshapeCollapsed.find(r.color) == m_RuneshapeCollapsed.end());
+                ImGui::SetNextItemOpen(wantOpen);
+                char header[256];
+                snprintf(header, sizeof(header), "%s%s###rscol%08X",
+                         r.anchorName.c_str(), std::string(static_cast<size_t>(padCnt), ' ').c_str(),
+                         static_cast<unsigned>(r.color));
+                const bool open = ImGui::CollapsingHeader(header, ImGuiTreeNodeFlags_DefaultOpen);
+                if (open == !wantOpen) {   // user toggled this frame
+                    if (open) m_RuneshapeCollapsed.erase(r.color); else m_RuneshapeCollapsed.insert(r.color);
+                    SaveSettings();
+                }
+
+                // — decorate the header's right side: [dots] ... [currency icon] number —
+                {
+                    const ImVec2 hmin = ImGui::GetItemRectMin();
+                    const ImVec2 hmax = ImGui::GetItemRectMax();
+                    const float  midY = (hmin.y + hmax.y) * 0.5f;
+                    float xr = hmax.x - 8.0f;
+                    if (bestPriced) {
+                        if (ctex && ctex->valid) {
+                            const float nx = ImGui::CalcTextSize(bestNum.c_str()).x;
+                            xr -= nx;
+                            dl->AddText(ImVec2(xr, midY - lineH * 0.5f), IM_COL32(255,255,255,255), bestNum.c_str());
+                            xr -= 4.0f;
+                            const float iw = lineH * (ctex->h ? static_cast<float>(ctex->w) / static_cast<float>(ctex->h) : 1.0f);
+                            xr -= iw;
+                            dl->AddImage(ctex->id, ImVec2(xr, midY - lineH * 0.5f), ImVec2(xr + iw, midY + lineH * 0.5f));
+                            xr -= 10.0f;
+                        } else {
+                            const float tx = ImGui::CalcTextSize(bestText.c_str()).x;
+                            xr -= tx;
+                            dl->AddText(ImVec2(xr, midY - lineH * 0.5f), IM_COL32(255,255,255,255), bestText.c_str());
+                            xr -= 10.0f;
+                        }
+                    }
+                    for (int hi = 0; hi < r.holeCount; ++hi) {
+                        // The dot at a propagating slot is drawn yellow and larger
+                        // (0.5.4 rune carryover): the rune in that slot carries over.
+                        bool prop = false;
+                        for (int ps : r.propagatingSlots) if (ps == hi) { prop = true; break; }
+                        const float dr = prop ? dotR * 1.5f : dotR;
+                        xr -= dr * 2.0f;
+                        dl->AddCircleFilled(ImVec2(xr + dr, midY), dr,        IM_COL32(20,20,20,200));
+                        dl->AddCircleFilled(ImVec2(xr + dr, midY), dr - 1.0f,
+                                            prop ? IM_COL32(255,210,60,255) : IM_COL32(220,220,220,235));
+                        if (hi + 1 < r.holeCount) xr -= 4.0f;
+                    }
+                }
+
+                // — reward rows (only when expanded) —
+                if (open && !rewards.empty()) {
                     ImGui::Indent(kSquareSz + 4.0f);
                     for (const auto& rw : rewards) {
-                        if (!rw.priced) continue;
-                        float displayVal = ChaosToDisplay(rw.totalChaos, divInChaos, exInChaos);
-                        std::string priceStr = FormatPriceLocal(displayVal, m_DisplayCurrency);
                         char row[256];
-                        snprintf(row, sizeof(row), "%s  x%d   %s",
-                                 rw.name.c_str(), rw.count, priceStr.c_str());
-                        ImGui::TextUnformatted(row);
+                        if (rw.priced) {
+                            float displayVal = ChaosToDisplay(rw.totalChaos, divInChaos, exInChaos);
+                            std::string priceStr = FormatPriceLocal(displayVal, m_DisplayCurrency);
+                            if (m_ShowItemIcons) {
+                                auto pr = ctx()->Prices.LookupPrice(rw.name);
+                                const CurrencyTex* itex = GetItemTexture(pr.iconPath);
+                                if (itex) {
+                                    float h = ImGui::GetTextLineHeight();
+                                    ImGui::Image(itex->id, ImVec2(h, h));
+                                    ImGui::SameLine(0.0f, 4.0f);
+                                }
+                            }
+                            snprintf(row, sizeof(row), "%s  x%d   %s",
+                                     rw.name.c_str(), rw.count, priceStr.c_str());
+                            ImGui::TextUnformatted(row);
+                        } else {
+                            // No price found — still list the reward, dimmed.
+                            snprintf(row, sizeof(row), "%s  x%d",
+                                     rw.name.c_str(), rw.count);
+                            ImGui::TextDisabled("%s", row);
+                        }
+
+                        // Propagating-rune marker (0.5.4 carryover): a gold dot +
+                        // the rune(s) that carry over if this recipe is completed.
+                        // Rune name is purple when it is a rare ("valuable") rune.
+                        if (rw.propagatingCount > 0 && !rw.propagatingRunes.empty()) {
+                            ImGui::SameLine(0.0f, 10.0f);
+                            ImDrawList* rdl = ImGui::GetWindowDrawList();
+                            const float  lh  = ImGui::GetTextLineHeight();
+                            const float  rad = lh * 0.26f;
+                            const ImVec2 cp  = ImGui::GetCursorScreenPos();
+                            rdl->AddCircleFilled(ImVec2(cp.x + rad, cp.y + lh * 0.5f), rad,
+                                                 IM_COL32(255, 210, 60, 255));   // gold dot
+                            ImGui::Dummy(ImVec2(rad * 2.0f + 5.0f, lh));
+                            ImGui::SameLine(0.0f, 0.0f);
+                            const ImVec4 rcol = rw.propagatingHasRare
+                                ? ImVec4(0.80f, 0.52f, 1.0f, 1.0f)   // purple = rare / valuable
+                                : ImVec4(1.0f, 0.82f, 0.27f, 1.0f);  // gold
+                            ImGui::TextColored(rcol, "%s", rw.propagatingRunes.c_str());
+                            if (ImGui::IsItemHovered())
+                                ImGui::SetTooltip("Propagating rune - carries over to the next remnant");
+                        }
                     }
                     ImGui::Unindent(kSquareSz + 4.0f);
                 }
@@ -1544,6 +1728,7 @@ private:
             rr.labelAddr = label;
             rr.total = total;
             rr.chaos = price.chaos * qty;
+            rr.iconPath = price.iconPath;
             m_RuneshapeRows.push_back(rr);
         }
     }
@@ -1597,7 +1782,8 @@ private:
             // No adaptive shrink: the price draws in the open gap beside the reward
             // text (not inside a tiny cell), so use the full configured size.
             float fontSize = baseFontSize;
-            PriceTag tag = MeasurePriceTag(r.total, fontSize);
+            PriceTag tag = MeasurePriceTag(r.total, fontSize,
+                m_ShowItemIcons ? r.iconPath : std::string());
 
             float gap = fontSize * 0.4f;
             float labelX = x - tag.totalW - gap;
@@ -1636,6 +1822,8 @@ private:
                 m_ShowRitualPrices = j["showRitualPrices"].get<bool>();
             if (j.contains("showRuneshapePrices") && j["showRuneshapePrices"].is_boolean())
                 m_ShowRuneshapePrices = j["showRuneshapePrices"].get<bool>();
+            if (j.contains("showItemIcons") && j["showItemIcons"].is_boolean())
+                m_ShowItemIcons = j["showItemIcons"].get<bool>();
             if (j.contains("showRuneshapeWindow") && j["showRuneshapeWindow"].is_boolean())
                 m_ShowRuneshapeWindow = j["showRuneshapeWindow"].get<bool>();
             if (j.contains("runeshapeWinX") && j["runeshapeWinX"].is_number())
@@ -1646,6 +1834,7 @@ private:
                 m_RuneshapeWinAlpha = std::clamp(j["runeshapeWinAlpha"].get<float>(), 0.1f, 1.0f);
             if (j.contains("runeshapeWinCollapsed") && j["runeshapeWinCollapsed"].is_boolean())
                 m_RuneshapeWinCollapsed = j["runeshapeWinCollapsed"].get<bool>();
+            if (j.contains("runeshapeCollapsed") && j["runeshapeCollapsed"].is_array()) { m_RuneshapeCollapsed.clear(); for (auto& c : j["runeshapeCollapsed"]) if (c.is_number_unsigned()) m_RuneshapeCollapsed.insert(c.get<uint32_t>()); }
             if (j.contains("hideWhenUnfocused") && j["hideWhenUnfocused"].is_boolean())
                 m_HideWhenUnfocused = j["hideWhenUnfocused"].get<bool>();
             if (j.contains("hideHotkey") && j["hideHotkey"].is_number_integer())
@@ -1680,6 +1869,7 @@ private:
     bool m_ShowOtherInventoryPrices = false;  // Off by default — minor frame-time impact
     bool m_ShowRitualPrices = true;           // On by default — Ritual "Favours" shop pricing
     bool m_ShowRuneshapePrices = true;        // On by default — Runeshape Combinations reward pricing
+    bool m_ShowItemIcons = true;              // On by default — item icon left of price tag
     bool m_HideWhenUnfocused = true;
     int m_HideHotkey = 0;
     UiPricePosition m_UiPricePosition = UiPricePosition::BottomRight;
@@ -1741,6 +1931,7 @@ private:
     float m_RuneshapeWinY = 100.0f;
     float m_RuneshapeWinAlpha = 0.85f;
     bool  m_RuneshapeWinCollapsed = false;   // persisted collapse state of the window
+    std::unordered_set<uint32_t> m_RuneshapeCollapsed; // persisted per-element collapse (keyed by color)
 
     // ---- Runeshape Combinations overlay ----
     // Cached row-list container of the open "Runeshape Combinations" panel
@@ -1758,6 +1949,7 @@ private:
         uintptr_t labelAddr = 0;    // reward-label child (price anchor rect)
         float total = 0;            // display-currency value (unit * qty)
         float chaos = 0;            // chaos value (unit * qty), for color
+        std::string iconPath;       // item icon path (from PriceIconCache)
     };
     std::vector<RuneshapeRow> m_RuneshapeRows;
 

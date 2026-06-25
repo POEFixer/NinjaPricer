@@ -2355,6 +2355,7 @@ struct Runeshape {
     std::string anchorName;
     int         rewardCount = 0;
     int         bestIndex   = -1;
+    std::vector<int> propagatingSlots;  // slot(s) whose rune propagates (0.5.4)
 };
 
 // One reward slot for a Runeshape device.
@@ -2364,6 +2365,10 @@ struct RuneshapeReward {
     float       unitChaos  = 0.f;
     float       totalChaos = 0.f;
     bool        priced     = false;
+    // Rune propagation (0.5.4): rune(s) at this recipe's propagating slot(s).
+    std::string propagatingRunes;            // e.g. "Power" / "Cold, Time"; "" if none
+    int         propagatingCount   = 0;
+    bool        propagatingHasRare = false;  // any propagating rune is rare ("purple")
 };
 
 // Runeshape devices and their per-entity reward lists.
@@ -2394,6 +2399,8 @@ public:
                 r.anchorName = a->anchor_name;  // NUL-terminated char buffer
                 r.rewardCount = a->reward_count;
                 r.bestIndex  = a->best_index;
+                for (int i = 0; i < a->propagating_slot_count && i < 4; ++i)
+                    r.propagatingSlots.push_back(a->propagating_slots[i]);
                 p->out->push_back(std::move(r));
                 return 1;
             },
@@ -2416,6 +2423,9 @@ public:
                 r.unitChaos  = a->unit_chaos;
                 r.totalChaos = a->total_chaos;
                 r.priced     = a->priced != 0;
+                r.propagatingRunes   = a->propagating_runes;  // NUL-terminated
+                r.propagatingCount   = a->propagating_count;
+                r.propagatingHasRare = a->propagating_has_rare != 0;
                 p->out->push_back(std::move(r));
                 return 1;
             },
