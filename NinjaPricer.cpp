@@ -407,6 +407,7 @@ public:
             m_NameCache.clear();
             m_CachedInventories.clear();
             m_RarityCache.clear();
+            m_PriceCache.clear();
             m_LastInventoryScan = {};   // force immediate refresh in new area
             m_InvReadPending = false;
             m_RuneshapeListAddr = 0;
@@ -423,6 +424,21 @@ public:
 
         m_CachedDivineInChaos  = st.divineInChaos;
         if (st.exaltedInChaos > 0.0f) m_CachedExaltedInChaos = st.exaltedInChaos;
+
+        // Invalidate the cross-frame price memo when the host DB refreshes (its
+        // chaos rates shift) or on a periodic safety net, so cached prices can't
+        // go stale within a long-lived area (e.g. sitting in the hideout).
+        {
+            auto nowPC = std::chrono::steady_clock::now();
+            if (st.divineInChaos  != m_PriceCacheDivineSeen ||
+                st.exaltedInChaos != m_PriceCacheExaltedSeen ||
+                nowPC - m_LastPriceCacheFlush > std::chrono::seconds(30)) {
+                m_PriceCache.clear();
+                m_PriceCacheDivineSeen  = st.divineInChaos;
+                m_PriceCacheExaltedSeen = st.exaltedInChaos;
+                m_LastPriceCacheFlush   = nowPC;
+            }
+        }
 
         // Reset per-frame perf accumulators (TimedLookup feeds these).
         m_PerfLookupMs = 0.0;
@@ -1244,12 +1260,28 @@ private:
         return static_cast<double>(c.QuadPart) * 1000.0 / static_cast<double>(freq.QuadPart);
     }
 
+    // Memoized price lookup (positive AND negative). The host LookupPrice
+    // degrades to an O(DB-size) whole-word scan on every exact miss (most
+    // gear/rares), and the overlays call it per item EVERY frame — so the miss
+    // is exactly the path that must be cached. Keyed by the game's display name,
+    // which maps deterministically to a price until the DB refreshes. Render
+    // thread only (all callers run inside DrawUI), so no locking is needed.
+    PluginSDK::PriceResult CachedLookupPrice(const std::string& name) {
+        auto it = m_PriceCache.find(name);
+        if (it != m_PriceCache.end()) return it->second;
+        PluginSDK::PriceResult r = ctx()->Prices.LookupPrice(name);
+        m_PriceCache.emplace(name, r);
+        return r;
+    }
+
     // LookupPrice wrapper that accumulates per-frame timing + match-kind counts
-    // into the m_Perf* fields. Used by the hot per-frame draw paths (ground +
-    // inventory).
+    // for the Debug perf panel. Routes through the cross-frame memo, so a cache
+    // hit costs ~0 and the panel's "LookupPrice/frame" reads near-zero once the
+    // cache is warm (the fix visible in situ). The found/miss counts still tick
+    // every frame, so "X found, Y miss" keeps reflecting items priced this frame.
     PluginSDK::PriceResult TimedLookup(const std::string& name) {
         double t0 = PerfNowMs();
-        PluginSDK::PriceResult r = ctx()->Prices.LookupPrice(name);
+        PluginSDK::PriceResult r = CachedLookupPrice(name);
         m_PerfLookupMs += (PerfNowMs() - t0);
         if (r.found) ++m_PerfLookupExact;
         else         ++m_PerfLookupMiss;
@@ -1635,7 +1667,7 @@ private:
                             float displayVal = ChaosToDisplay(rw.totalChaos, divInChaos, exInChaos);
                             std::string priceStr = FormatPriceLocal(displayVal, m_DisplayCurrency);
                             if (m_ShowItemIcons) {
-                                auto pr = ctx()->Prices.LookupPrice(rw.name);
+                                auto pr = CachedLookupPrice(rw.name);
                                 const CurrencyTex* itex = GetItemTexture(pr.iconPath);
                                 if (itex) {
                                     float h = ImGui::GetTextLineHeight();
@@ -1717,7 +1749,7 @@ private:
             int qty; std::string name;
             if (!ParseReward(text, qty, name)) continue;
 
-            PluginSDK::PriceResult price = ctx()->Prices.LookupPrice(name);
+            PluginSDK::PriceResult price = CachedLookupPrice(name);
             if (!price.found) continue;
 
             float total = GetDisplayValue(price, m_DisplayCurrency) * qty;
@@ -1893,6 +1925,18 @@ private:
     // Per-item rarity cache for the high-value unique gate. Keyed by
     // InventoryItem::Address, cleared alongside m_CachedInventories.
     std::unordered_map<uintptr_t, int> m_RarityCache;
+
+    // Cross-frame price memo (positive AND negative). Without it the inventory/
+    // ground overlays re-run the host LookupPrice for every visible item every
+    // frame; that lookup is O(DB-size) on a miss (most gear/rares), so a full
+    // stash tab sustains DrawUI > 50 ms and the host perf-watchdog disables the
+    // plugin. Memoizing by display name collapses the per-frame cost to O(items)
+    // hash lookups. Cleared on area change and when the host DB refreshes (rate
+    // shift) or on a 30 s safety interval. See CachedLookupPrice / TimedLookup.
+    std::unordered_map<std::string, PluginSDK::PriceResult> m_PriceCache;
+    float m_PriceCacheDivineSeen  = 0.0f;
+    float m_PriceCacheExaltedSeen = 0.0f;
+    std::chrono::steady_clock::time_point m_LastPriceCacheFlush;
 
     // ---- Perf diagnostics (Debug tab "Performance" section) ----------------
     // All render-thread (DrawUI) timings, in milliseconds, peak-held. The scan-
