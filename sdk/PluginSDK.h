@@ -1243,6 +1243,17 @@ public:
         return Snapshot::FromAbi(raw, m_host);
     }
 
+    // Cheap area-change counter WITHOUT the per-entity enumeration that
+    // GetSnapshot() does in Snapshot::FromAbi. The host get_snapshot ABI fills
+    // only scalars (+ player/maps/vitals), so a plugin can detect area
+    // transitions every frame without paying the full-snapshot cost. Bumps on
+    // every area load (use it to re-arm per-area work).
+    uint64_t GetAreaChangeCounter() const {
+        SnapshotAbi raw{};
+        if (m_abi && m_abi->get_snapshot) m_abi->get_snapshot(&raw);
+        return raw.area_change_counter;
+    }
+
     GameState GetState() const {
         return static_cast<GameState>(
             (m_abi && m_abi->get_state) ? m_abi->get_state() : PSDK_GAME_STATE_NOT_LOADED);

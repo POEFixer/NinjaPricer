@@ -399,23 +399,29 @@ public:
         if (m_HideWhenUnfocused && !IsGameWindowFocused()) return;
         if (m_HideHotkey != 0 && (GetAsyncKeyState(m_HideHotkey) & 0x8000)) return;
 
-        PluginSDK::Snapshot snap = ctx()->Game.GetSnapshot();
-        if (!snap.IsAttached) return;
-        if (snap.State != PluginSDK::GameState::InGame) return;
+        // Per-frame gates use cheap accessors — NOT GetSnapshot(), which enumerates
+        // every entity (hundreds–1000+ in a busy map). The only thing that needs the
+        // entity list is the ground-item scan, which is throttled + cached below.
+        if (!ctx()->Game.IsAttached()) return;
+        if (!ctx()->Game.IsInGame()) return;
 
-        if (snap.AreaChangeCounter != m_LastAreaChange) {
+        uint64_t areaChange = ctx()->Game.GetAreaChangeCounter();
+        if (areaChange != m_LastAreaChange) {
             m_NameCache.clear();
             m_CachedInventories.clear();
             m_RarityCache.clear();
             m_PriceCache.clear();
+            m_GroundTags.clear();
+            m_GroundResolveCache.clear();
             m_LastInventoryScan = {};   // force immediate refresh in new area
+            m_LastGroundScan = {};
             m_InvReadPending = false;
             m_RuneshapeListAddr = 0;
             m_RuneshapeWindowAddr = 0;
             m_RuneshapeRows.clear();
             m_LastRuneshapeScan = {};
             m_LastRuneshapeDiscover = {};   // allow immediate rediscovery in the new area
-            m_LastAreaChange = snap.AreaChangeCounter;
+            m_LastAreaChange = areaChange;
         }
 
         // Gate on the host price service being ready.
@@ -434,6 +440,7 @@ public:
                 st.exaltedInChaos != m_PriceCacheExaltedSeen ||
                 nowPC - m_LastPriceCacheFlush > std::chrono::seconds(30)) {
                 m_PriceCache.clear();
+                m_GroundResolveCache.clear();   // cached resolves hold PriceResults — refresh with prices
                 m_PriceCacheDivineSeen  = st.divineInChaos;
                 m_PriceCacheExaltedSeen = st.exaltedInChaos;
                 m_LastPriceCacheFlush   = nowPC;
@@ -445,8 +452,17 @@ public:
         m_PerfLookupExact = m_PerfLookupMiss = 0;
 
         if (m_ShowGroundPrices) {
+            // Throttle the entity enumeration + per-item name/price/rarity/stack
+            // resolves to the scan interval; redraw the cached tags every frame
+            // (cheap WorldToScreen, no memory reads). Previously this iterated the
+            // FULL entity list and re-resolved every item EVERY frame.
+            auto nowG = std::chrono::steady_clock::now();
+            if (nowG - m_LastGroundScan > std::chrono::milliseconds(m_PerfScanIntervalMs)) {
+                m_LastGroundScan = nowG;
+                ScanGroundItems();
+            }
             double tg0 = PerfNowMs();
-            DrawGroundItemPrices(snap);
+            DrawGroundTags();
             m_PerfGroundMs = PerfNowMs() - tg0;
             if (m_PerfGroundMs > m_PerfPeakGroundMs) m_PerfPeakGroundMs = m_PerfGroundMs;
         }
@@ -510,7 +526,7 @@ public:
                 ScanRuneshapeRows();
                 m_LastRuneshapeScan = nowR;
             }
-            DrawRuneshapeOverlay(snap);
+            DrawRuneshapeOverlay();
         }
 
         if (m_ShowRuneshapeWindow) {
@@ -745,51 +761,99 @@ private:
     // WorldToScreen on the entity's world coordinates.
     // ========================================================================
 
-    void DrawGroundItemPrices(const PluginSDK::Snapshot& snap) {
-        ImDrawList* dl = ImGui::GetForegroundDrawList();
-        float baseFontSize = ImGui::GetFontSize() * m_TextScale;
-        float baseRefSize = ImGui::GetFontSize();
-        if (baseRefSize <= 0.f) return;
+    // Enumerate ground WorldItems and resolve everything needed to draw a price tag
+    // (world pos + display value + chaos value for the colour threshold + icon).
+    // RPM-heavy (entity list + per-item name/inner/mods/stack reads), so DrawUI runs
+    // this on the scan interval, NOT every frame. Result is cached in m_GroundTags.
+    void ScanGroundItems() {
+        m_GroundTags.clear();
+        PluginSDK::Snapshot snap = ctx()->Game.GetSnapshot();
+        const uint32_t epoch = ++m_GroundScanEpoch;
 
         for (const auto& e : snap.Entities) {
-            if (e.EntityType != PluginSDK::EntityType::Item) continue;
+            if (e.EntityType != PluginSDK::EntityType::Item || !e.Address) continue;
 
-            std::string name = GetGroundLookupName(e);
-            if (name.empty()) continue;
-
-            PluginSDK::PriceResult price = TimedLookup(name);
-            if (!price.found) continue;
-
-            // Resolve the inner item once; reused for both rarity gate
-            // and stack multiplier so we never call GetWorldItemInner twice.
-            auto inner = ctx()->Entities.GetWorldItemInner(e.Address);
-
-            // Unique-category guard: LookupPrice can land on a unique entry
-            // via its contains-match path (e.g. base-type "Heavy Belt" hitting
-            // "Headhunter"). Require the actual entity to have Rarity == 3
-            // (Unique) before showing a unique price.
-            if (IsUniqueCategory(price.category)) {
-                if (!inner || !inner->Components.HasMods()) continue;
-                auto mods = ctx()->Components.ReadMods(inner->Components.Mods);
-                if (!mods.Valid || mods.Rarity != 3) continue;
+            auto cit = m_GroundResolveCache.find(e.Address);
+            if (cit == m_GroundResolveCache.end()) {
+                // New ground item: do the expensive resolve (name read + price
+                // lookup + inner/mods/stack RPM) ONCE and cache it. A ground item
+                // doesn't change while on the floor, so later scans reuse this and
+                // only newly-dropped items pay the cost — the throttled scan stays
+                // cheap instead of re-resolving every persistent item each tick.
+                GroundResolve r;
+                r.wx = e.WorldX; r.wy = e.WorldY; r.wz = e.WorldZ;
+                std::string name = GetGroundLookupName(e);
+                if (!name.empty()) {
+                    PluginSDK::PriceResult price = TimedLookup(name);
+                    if (price.found) {
+                        // Resolve the inner item once; reused for both rarity gate
+                        // and stack multiplier so we never call GetWorldItemInner twice.
+                        auto inner = ctx()->Entities.GetWorldItemInner(e.Address);
+                        bool ok = true;
+                        // Unique-category guard: LookupPrice can land on a unique entry
+                        // via its contains-match path (e.g. base-type "Heavy Belt"
+                        // hitting "Headhunter"). Require entity Rarity == 3 (Unique).
+                        if (IsUniqueCategory(price.category)) {
+                            if (!inner || !inner->Components.HasMods()) ok = false;
+                            else {
+                                auto mods = ctx()->Components.ReadMods(inner->Components.Mods);
+                                if (!mods.Valid || mods.Rarity != 3) ok = false;
+                            }
+                        }
+                        if (ok) {
+                            r.priceable = true;
+                            r.price = price;
+                            r.stackMultiplier = 1;
+                            if (inner && inner->Components.HasStack()) {
+                                int sc = ctx()->Components.GetStackCount(inner->Components.Stack);
+                                if (sc > 1) r.stackMultiplier = sc;
+                            }
+                        }
+                    }
+                }
+                cit = m_GroundResolveCache.emplace(e.Address, std::move(r)).first;
             }
+            cit->second.epoch = epoch;   // mark present this scan (for eviction)
 
-            int stackMultiplier = 1;
-            if (inner && inner->Components.HasStack()) {
-                int sc = ctx()->Components.GetStackCount(inner->Components.Stack);
-                if (sc > 1) stackMultiplier = sc;
-            }
+            const GroundResolve& gr = cit->second;
+            if (!gr.priceable) continue;
 
-            float displayValue =
-                GetDisplayValue(price, m_DisplayCurrency) * stackMultiplier;
+            // Currency-dependent values are cheap — recompute from the cached
+            // PriceResult each scan so a currency/icon toggle applies without an
+            // RPM re-read.
+            float displayValue = GetDisplayValue(gr.price, m_DisplayCurrency) * gr.stackMultiplier;
             if (displayValue < 0.001f) continue;
 
+            GroundTag t;
+            t.wx = gr.wx; t.wy = gr.wy; t.wz = gr.wz;
+            t.displayValue = displayValue;
+            t.chaos = gr.price.chaos * gr.stackMultiplier;
+            t.iconPath = m_ShowItemIcons ? gr.price.iconPath : std::string();
+            m_GroundTags.push_back(std::move(t));
+        }
+
+        // Evict resolves for items no longer on the ground (picked up / despawned).
+        for (auto it = m_GroundResolveCache.begin(); it != m_GroundResolveCache.end(); ) {
+            if (it->second.epoch != epoch) it = m_GroundResolveCache.erase(it);
+            else ++it;
+        }
+    }
+
+    // Per-frame render of the cached ground tags. No memory reads — only
+    // WorldToScreen (the camera pans every frame, so screen pos must refresh) +
+    // measure + draw.
+    void DrawGroundTags() {
+        if (m_GroundTags.empty()) return;
+        ImDrawList* dl = ImGui::GetForegroundDrawList();
+        float baseFontSize = ImGui::GetFontSize() * m_TextScale;
+        if (ImGui::GetFontSize() <= 0.f) return;
+
+        for (const auto& t : m_GroundTags) {
             float sx, sy;
-            if (!ctx()->Render.WorldToScreen(e.WorldX, e.WorldY, e.WorldZ, sx, sy))
+            if (!ctx()->Render.WorldToScreen(t.wx, t.wy, t.wz, sx, sy))
                 continue;
 
-            PriceTag tag = MeasurePriceTag(displayValue, baseFontSize,
-                m_ShowItemIcons ? price.iconPath : std::string());
+            PriceTag tag = MeasurePriceTag(t.displayValue, baseFontSize, t.iconPath);
 
             // Anchor is a single screen point (zero-sized box). CalcGroundPricePos
             // already centres the block around (sx, sy) with the four presets.
@@ -797,8 +861,7 @@ private:
             CalcGroundPricePos(sx, sy, /*labelW=*/0.0f, /*labelH=*/0.0f,
                                tag.totalW, tag.totalH, baseFontSize, blockX, blockY);
 
-            DrawPriceTag(dl, baseFontSize, blockX, blockY, tag,
-                         price.chaos * stackMultiplier);
+            DrawPriceTag(dl, baseFontSize, blockX, blockY, tag, t.chaos);
         }
     }
 
@@ -1776,15 +1839,16 @@ private:
     // the intersection of the ancestor container rects (recipe list up to the
     // panel window): whichever ancestor is the real clipper bounds the result,
     // and a content-sized ancestor rect just contributes a looser bound.
-    void DrawRuneshapeOverlay(const PluginSDK::Snapshot& snap) {
+    void DrawRuneshapeOverlay() {
         if (m_RuneshapeRows.empty()) return;
         // Per-frame open/closed gate: rows cached by the 400 ms scan must vanish
         // the instant the panel closes (the subtree persists, bits cleared).
         if (m_RuneshapeWindowAddr && !ctx()->Ui.IsVisible(m_RuneshapeWindowAddr)) return;
 
+        PluginSDK::ScreenSize screen = ctx()->Game.GetScreenSize();
         float clipX0 = 0.0f, clipY0 = 0.0f;
-        float clipX1 = static_cast<float>(snap.ScreenWidth);
-        float clipY1 = static_cast<float>(snap.ScreenHeight);
+        float clipX1 = screen.Width;
+        float clipY1 = screen.Height;
         uintptr_t node = m_RuneshapeListAddr;
         for (int i = 0; node && i < 8; ++i) {
             float x, y, w, h;
@@ -1916,6 +1980,26 @@ private:
     std::unordered_map<uint32_t, std::string> m_NameCache;
     uint64_t m_LastAreaChange = 0;
     std::chrono::steady_clock::time_point m_LastInventoryScan;
+    // Ground-item price tags, rebuilt by ScanGroundItems() on the scan interval and
+    // drawn every frame by DrawGroundTags(). Decouples the heavy per-item resolve
+    // (entity enumeration + RPM) from the cheap per-frame WorldToScreen render.
+    struct GroundTag { float wx, wy, wz; float displayValue; float chaos; std::string iconPath; };
+    std::vector<GroundTag> m_GroundTags;
+    std::chrono::steady_clock::time_point m_LastGroundScan;
+    // Per-entity-address resolve cache so the throttled ground scan re-resolves only
+    // newly-dropped items (persistent items reuse the prior result). Holds the
+    // RPM-derived bits (price + stack); currency-dependent display value is cheap and
+    // recomputed each scan. Cleared on area change and on every price-cache flush
+    // (DB refresh / 30 s) so prices stay fresh. `epoch` marks presence for eviction.
+    struct GroundResolve {
+        bool priceable = false;
+        float wx = 0, wy = 0, wz = 0;
+        PluginSDK::PriceResult price{};
+        int stackMultiplier = 1;
+        uint32_t epoch = 0;
+    };
+    std::unordered_map<uintptr_t, GroundResolve> m_GroundResolveCache;
+    uint32_t m_GroundScanEpoch = 0;
 
     // Inventory data cache — refreshed once per Scan tick. Avoids
     // 60-FPS bridge round-trips through Inventory.GetAll() + per-item
