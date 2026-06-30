@@ -586,7 +586,7 @@ typedef struct {
 } InventoryAbi;
 
 // One mod (enumerate_item_mods). generation_type: 1=prefix 2=suffix 3=implicit.
-// The three *_addr fields are host-owned strings.
+// The *_addr fields are host-owned strings.
 typedef struct {
     int32_t generation_type;
     float   value0;
@@ -594,6 +594,11 @@ typedef struct {
     uintptr_t name_addr;
     uintptr_t stat_key_addr;
     uintptr_t affix_name_addr;
+    // --- APPEND-ONLY (mod identity; disambiguates mods that share a stat key and
+    //     drives the radius-jewel wrapper). Passed by const ptr per visitor callback,
+    //     so older plugins safely read only the prefix above. Maps to Mods.dat. ---
+    uintptr_t id_addr;   // Mods.dat Id, e.g. "JewelRadiusCooldownSpeed"; 0 if unset
+    uint32_t  hash32;    // Mods.dat HASH32 (primary catalog key)
 } ModAbi;
 
 // One UI element (UiService::read). string_id_addr is host-owned.

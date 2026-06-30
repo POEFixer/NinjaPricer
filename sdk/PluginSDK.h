@@ -644,6 +644,8 @@ struct Mod {
     std::string Name;
     std::string StatKey;
     std::string AffixName;
+    std::string Id;            // Mods.dat Id (disambiguates shared stat keys); "" if host predates this field
+    uint32_t    Hash32 = 0;    // Mods.dat HASH32 catalog key
     int   GenerationType = 0;
     float Value0 = 0.f;
     float Value1 = 0.f;
@@ -658,6 +660,8 @@ struct Mod {
         m.Name           = FetchString(a.name_addr, abi);
         m.StatKey        = FetchString(a.stat_key_addr, abi);
         m.AffixName      = FetchString(a.affix_name_addr, abi);
+        m.Id             = FetchString(a.id_addr, abi);
+        m.Hash32         = a.hash32;
         return m;
     }
 };
