@@ -18,6 +18,7 @@
 
 #include "lib/nlohmann/json.hpp"
 
+#include <array>
 #include <fstream>
 #include <filesystem>
 #include <string>
@@ -348,6 +349,10 @@ public:
             ImGui::SliderFloat("Runeshape window opacity", &m_RuneshapeWinAlpha, 0.1f, 1.0f, "%.2f");
         }
 
+        ImGui::Checkbox("Runeshape weights", &m_ShowRuneshapeWeights);
+        ImGui::SameLine();
+        ImGui::TextDisabled("(total rune weight per combination; edit weights in Radar -> RuneShape)");
+
         ImGui::Checkbox("Show item icons", &m_ShowItemIcons);
 
         ImGui::Checkbox("Hide when game not focused", &m_HideWhenUnfocused);
@@ -516,7 +521,7 @@ public:
         // Finalize per-frame lookup peaks (after all draw paths contributed).
         if (m_PerfLookupMs > m_PerfPeakLookupMs) m_PerfPeakLookupMs = m_PerfLookupMs;
 
-        if (m_ShowRuneshapePrices) {
+        if (m_ShowRuneshapePrices || m_ShowRuneshapeWeights) {
             auto nowR = std::chrono::steady_clock::now();
             // 400 ms refresh: when the panel is open the rebuild is cheap (cached
             // list, fast-path), so a tighter cadence just makes prices appear and
@@ -552,6 +557,7 @@ public:
             j["showOtherInventoryPrices"] = m_ShowOtherInventoryPrices;
             j["showRitualPrices"] = m_ShowRitualPrices;
             j["showRuneshapePrices"] = m_ShowRuneshapePrices;
+            j["showRuneshapeWeights"] = m_ShowRuneshapeWeights;
             j["showItemIcons"] = m_ShowItemIcons;
             j["showRuneshapeWindow"] = m_ShowRuneshapeWindow;
             j["runeshapeWinX"] = m_RuneshapeWinX;
@@ -1437,6 +1443,22 @@ private:
         return false;
     }
 
+    // Count a recipe row's rune-symbol children (same ~50x50 heuristic as
+    // RowHasSymbol) — the row's combination size, used to disambiguate
+    // same-name rewards coming from different-size recipes.
+    int CountRowSymbols(uintptr_t row) {
+        if (!row) return 0;
+        int n = 0;
+        for (uintptr_t c : ctx()->Ui.GetChildren(row)) {
+            if (!c) continue;
+            PluginSDK::UiElement e = ctx()->Ui.Read(c);
+            if (e.Valid && e.UnscaledWidth >= 30.0f && e.UnscaledWidth <= 80.0f
+                        && e.UnscaledHeight >= 30.0f && e.UnscaledHeight <= 80.0f)
+                ++n;
+        }
+        return n;
+    }
+
     // Bounded BFS for the element whose StringId == target. When visibleOnly,
     // only descend into visible nodes (cheap while the panel is open).
     uintptr_t BfsFindStringId(uintptr_t root, const char* target,
@@ -1624,14 +1646,17 @@ private:
 
             for (const auto& r : rs) {
                 auto rewards = ctx()->Runeshape.Rewards(r.entityId);
+                const bool completed = r.completed;   // activated & cleared → gray entry
 
-                // — measure holes dots + best price (currency icon + number) so the
-                //   auto-resize header reserves room; both are drawn on the header's
-                //   right side as decorations (keeps the inline look). —
+                // — measure rune sockets + best price (currency icon + number) so the
+                //   auto-resize header reserves room; the header shows, left to right:
+                //   [sockets] [price] [weight] (no anchor name — the anchor rune is
+                //   visible in its socket). —
                 const float lineH = ImGui::GetTextLineHeight();
-                const float dotR  = lineH * 0.18f;
-                const float dotStride = dotR * 2.0f + 4.0f;
-                const float dotsW = (r.holeCount > 0) ? (r.holeCount * dotStride) : 0.0f;
+                const float slotSz  = lineH;                 // compact socket, one line tall
+                const float slotGap = 3.0f;
+                const float dotsW = (r.holeCount > 0)
+                    ? (r.holeCount * slotSz + (r.holeCount - 1) * slotGap) : 0.0f;
 
                 bool  bestPriced = (r.bestIndex >= 0 &&
                                     r.bestIndex < static_cast<int>(rewards.size()) &&
@@ -1653,9 +1678,23 @@ private:
                     }
                 }
 
-                // Reserve space in the header label (auto-resize window) so the
-                // right-side decorations never overlap the anchor name.
-                const float reserve = dotsW + (priceW > 0.0f ? priceW + 10.0f : 0.0f) + 16.0f;
+                // — station best-combination weight (host RuneShape tab), shown
+                //   left of the hole dots in the header decorations —
+                char  hdrWBuf[16] = {};
+                ImU32 hdrWCol = IM_COL32(190, 190, 190, 255);
+                float hdrWW = 0.0f;
+                if (m_ShowRuneshapeWeights) {
+                    snprintf(hdrWBuf, sizeof(hdrWBuf),
+                             (r.comboWeight > 0) ? "+%d" : "%d", r.comboWeight);
+                    if (r.comboWeight > 0)      hdrWCol = IM_COL32(110, 235, 110, 255);
+                    else if (r.comboWeight < 0) hdrWCol = IM_COL32(255, 110, 110, 255);
+                    hdrWW = ImGui::CalcTextSize(hdrWBuf).x;
+                }
+
+                // Reserve header width for the left-anchored content (the label
+                // itself is just padding — sockets/price/weight draw over it).
+                const float reserve = dotsW + (priceW > 0.0f ? priceW + 10.0f : 0.0f)
+                                    + (hdrWW > 0.0f ? hdrWW + 10.0f : 0.0f) + 8.0f;
                 const float spaceW  = ImGui::CalcTextSize(" ").x;
                 const int   padCnt  = (spaceW > 0.0f) ? static_cast<int>(ceilf(reserve / spaceW)) : 0;
 
@@ -1666,7 +1705,8 @@ private:
                 ImVec2 p = ImGui::GetCursorScreenPos();
                 dl->AddRectFilled(ImVec2(p.x, p.y + sqYOff),
                                   ImVec2(p.x + kSquareSz, p.y + sqYOff + kSquareSz),
-                                  static_cast<ImU32>(r.color), 2.0f);
+                                  completed ? IM_COL32(120, 120, 120, 255)
+                                            : static_cast<ImU32>(r.color), 2.0f);
                 ImGui::Dummy(ImVec2(kSquareSz, frameH));
                 ImGui::SameLine();
 
@@ -1675,8 +1715,8 @@ private:
                 const bool wantOpen = (m_RuneshapeCollapsed.find(r.color) == m_RuneshapeCollapsed.end());
                 ImGui::SetNextItemOpen(wantOpen);
                 char header[256];
-                snprintf(header, sizeof(header), "%s%s###rscol%08X",
-                         r.anchorName.c_str(), std::string(static_cast<size_t>(padCnt), ' ').c_str(),
+                snprintf(header, sizeof(header), "%s###rscol%08X",
+                         std::string(static_cast<size_t>(padCnt), ' ').c_str(),
                          static_cast<unsigned>(r.color));
                 const bool open = ImGui::CollapsingHeader(header, ImGuiTreeNodeFlags_DefaultOpen);
                 if (open == !wantOpen) {   // user toggled this frame
@@ -1684,45 +1724,115 @@ private:
                     SaveSettings();
                 }
 
-                // — decorate the header's right side: [dots] ... [currency icon] number —
+                // — header content, drawn left-to-right after the collapse arrow:
+                //   [rune sockets] [best price] [weight]. No anchor name — the
+                //   anchor rune is visible in its socket. Grayed when completed. —
                 {
                     const ImVec2 hmin = ImGui::GetItemRectMin();
-                    const ImVec2 hmax = ImGui::GetItemRectMax();
+                    const ImVec2 hmax = ImGui::GetItemRectMax(); (void)hmax;
                     const float  midY = (hmin.y + hmax.y) * 0.5f;
-                    float xr = hmax.x - 8.0f;
-                    if (bestPriced) {
-                        if (ctex && ctex->valid) {
-                            const float nx = ImGui::CalcTextSize(bestNum.c_str()).x;
-                            xr -= nx;
-                            dl->AddText(ImVec2(xr, midY - lineH * 0.5f), IM_COL32(255,255,255,255), bestNum.c_str());
-                            xr -= 4.0f;
-                            const float iw = lineH * (ctex->h ? static_cast<float>(ctex->w) / static_cast<float>(ctex->h) : 1.0f);
-                            xr -= iw;
-                            dl->AddImage(ctex->id, ImVec2(xr, midY - lineH * 0.5f), ImVec2(xr + iw, midY + lineH * 0.5f));
-                            xr -= 10.0f;
-                        } else {
-                            const float tx = ImGui::CalcTextSize(bestText.c_str()).x;
-                            xr -= tx;
-                            dl->AddText(ImVec2(xr, midY - lineH * 0.5f), IM_COL32(255,255,255,255), bestText.c_str());
-                            xr -= 10.0f;
+                    const ImU32  imgTint = completed ? IM_COL32(150, 150, 150, 200)
+                                                     : IM_COL32(255, 255, 255, 255);
+                    const ImU32  txtCol  = completed ? IM_COL32(150, 150, 150, 220)
+                                                     : IM_COL32(255, 255, 255, 255);
+
+                    float xl = hmin.x + ImGui::GetTreeNodeToLabelSpacing();
+
+                    // 1) rune sockets (slot 0 leftmost), game Remnant-bar look:
+                    //    RuneBgRegular/-Purple bg (purple = rare rune in that slot),
+                    //    each slot filled with the best-priced recipe's rune (anchor
+                    //    fallback when no recipe resolved), golden RunePropagation
+                    //    crown over the propagating slot(s). Falls back to circles
+                    //    when the art is missing.
+                    {
+                        static const std::string kRsUi    = "Resources/runeshape/ui/";
+                        static const std::string kRsRunes = "Resources/runeshape/runes/";
+                        // Expedition2Runes row -> name (mirrors expedition2_recipes.json).
+                        static const char* kRuneNames[34] = {
+                            "Fire", "Cold", "Lightning", "Tempest", "Momentum", "Bloodletting",
+                            "Stone", "Adaptive", "Arcane", "Toxic", "Electrocuting", "Protective",
+                            "Cyclonic", "Vision", "Tidal", "Rebirth", "Prismatic", "Gasp",
+                            "Moon", "Celestial", "Opulent", "Rage", "Wisdom", "Sky",
+                            "Earth", "Life", "Bond", "Ward", "Soul", "Death",
+                            "Oath", "Time", "Power", "Bait",
+                        };
+                        const CurrencyTex* bgReg = GetItemTexture(kRsUi + "RuneBgRegular.png");
+                        const CurrencyTex* bgPur = GetItemTexture(kRsUi + "RuneBgPurple.png");
+                        const CurrencyTex* glow  = GetItemTexture(kRsUi + "RunePropagation.png");
+
+                        for (int slot = 0; slot < r.holeCount; ++slot) {
+                            bool prop = false;
+                            for (int ps : r.propagatingSlots) if (ps == slot) { prop = true; break; }
+                            int rIdx = (slot < static_cast<int>(r.bestRunes.size())) ? r.bestRunes[slot] : -1;
+                            if (rIdx < 0 && r.anchorRuneIdx >= 0 && slot == r.anchorPos)
+                                rIdx = r.anchorRuneIdx;
+                            const bool slotRare = rIdx >= 23 && rIdx <= 32;
+
+                            const ImVec2 p0(xl, midY - slotSz * 0.5f);
+                            const ImVec2 p1(xl + slotSz, midY + slotSz * 0.5f);
+                            const CurrencyTex* bg = (slotRare && bgPur) ? bgPur : bgReg;
+                            if (bg && bg->valid) {
+                                dl->AddImage(bg->id, p0, p1, ImVec2(0, 0), ImVec2(1, 1), imgTint);
+                            } else {
+                                const float dr = slotSz * 0.5f - 1.0f;
+                                dl->AddCircleFilled(ImVec2(xl + slotSz * 0.5f, midY), dr, IM_COL32(20,20,20,200));
+                                dl->AddCircleFilled(ImVec2(xl + slotSz * 0.5f, midY), dr - 1.0f,
+                                                    prop ? IM_COL32(255,210,60,255) : IM_COL32(220,220,220,235));
+                            }
+                            const CurrencyTex* runeTex = (rIdx >= 0 && rIdx < 34)
+                                ? GetItemTexture(kRsRunes + std::string(kRuneNames[rIdx]) + ".png") : nullptr;
+                            if (runeTex && runeTex->valid) {
+                                const float inset = slotSz * 0.14f;
+                                dl->AddImage(runeTex->id, ImVec2(p0.x + inset, p0.y + inset),
+                                             ImVec2(p1.x - inset, p1.y - inset),
+                                             ImVec2(0, 0), ImVec2(1, 1), imgTint);
+                            }
+                            if (prop && !completed) {   // crown only while it still matters
+                                if (glow && glow->valid) {
+                                    // Game crown proportions: 108x176 art on a 100px socket,
+                                    // arc hugging the upper rim (top ≈ centerY − 1.2·socket).
+                                    const float cx2 = xl + slotSz * 0.5f;
+                                    const float gw  = slotSz * 1.08f;
+                                    const float gt  = midY - slotSz * 1.20f;
+                                    dl->AddImage(glow->id, ImVec2(cx2 - gw * 0.5f, gt),
+                                                 ImVec2(cx2 + gw * 0.5f, gt + slotSz * 1.76f));
+                                } else if (bg && bg->valid) {
+                                    dl->AddCircle(ImVec2(xl + slotSz * 0.5f, midY),
+                                                  slotSz * 0.52f, IM_COL32(255,210,60,255), 0, 1.5f);
+                                }
+                            }
+                            xl += slotSz + ((slot + 1 < r.holeCount) ? slotGap : 0.0f);
                         }
                     }
-                    for (int hi = 0; hi < r.holeCount; ++hi) {
-                        // The dot at a propagating slot is drawn yellow and larger
-                        // (0.5.4 rune carryover): the rune in that slot carries over.
-                        bool prop = false;
-                        for (int ps : r.propagatingSlots) if (ps == hi) { prop = true; break; }
-                        const float dr = prop ? dotR * 1.5f : dotR;
-                        xr -= dr * 2.0f;
-                        dl->AddCircleFilled(ImVec2(xr + dr, midY), dr,        IM_COL32(20,20,20,200));
-                        dl->AddCircleFilled(ImVec2(xr + dr, midY), dr - 1.0f,
-                                            prop ? IM_COL32(255,210,60,255) : IM_COL32(220,220,220,235));
-                        if (hi + 1 < r.holeCount) xr -= 4.0f;
+
+                    // 2) best price (currency icon + number, or text fallback)
+                    if (bestPriced) {
+                        xl += 10.0f;
+                        if (ctex && ctex->valid) {
+                            const float iw = lineH * (ctex->h ? static_cast<float>(ctex->w) / static_cast<float>(ctex->h) : 1.0f);
+                            dl->AddImage(ctex->id, ImVec2(xl, midY - lineH * 0.5f),
+                                         ImVec2(xl + iw, midY + lineH * 0.5f),
+                                         ImVec2(0, 0), ImVec2(1, 1), imgTint);
+                            xl += iw + 4.0f;
+                            dl->AddText(ImVec2(xl, midY - lineH * 0.5f), txtCol, bestNum.c_str());
+                            xl += ImGui::CalcTextSize(bestNum.c_str()).x;
+                        } else {
+                            dl->AddText(ImVec2(xl, midY - lineH * 0.5f), txtCol, bestText.c_str());
+                            xl += ImGui::CalcTextSize(bestText.c_str()).x;
+                        }
+                    }
+
+                    // 3) combination weight
+                    if (hdrWW > 0.0f) {
+                        xl += 10.0f;
+                        dl->AddText(ImVec2(xl, midY - lineH * 0.5f),
+                                    completed ? txtCol : hdrWCol, hdrWBuf);
                     }
                 }
 
-                // — reward rows (only when expanded) —
+                // — reward rows (only when expanded); dimmed for a cleared station —
                 if (open && !rewards.empty()) {
+                    if (completed) ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.5f);
                     ImGui::Indent(kSquareSz + 4.0f);
                     for (const auto& rw : rewards) {
                         char row[256];
@@ -1748,18 +1858,53 @@ private:
                             ImGui::TextDisabled("%s", row);
                         }
 
-                        // Propagating-rune marker (0.5.4 carryover): a gold dot +
-                        // the rune(s) that carry over if this recipe is completed.
-                        // Rune name is purple when it is a rare ("valuable") rune.
+                        // Total rune weight of THIS combination (host RuneShape tab).
+                        if (m_ShowRuneshapeWeights) {
+                            ImGui::SameLine(0.0f, 10.0f);
+                            const ImVec4 wc = (rw.comboWeight > 0) ? ImVec4(0.43f, 0.92f, 0.43f, 1.0f)
+                                            : (rw.comboWeight < 0) ? ImVec4(1.0f, 0.43f, 0.43f, 1.0f)
+                                                                   : ImVec4(0.72f, 0.72f, 0.72f, 1.0f);
+                            char wbuf[16];
+                            snprintf(wbuf, sizeof(wbuf),
+                                     (rw.comboWeight > 0) ? "+%d" : "%d", rw.comboWeight);
+                            ImGui::TextColored(wc, "%s", wbuf);
+                            if (ImGui::IsItemHovered())
+                                ImGui::SetTooltip("Total rune weight of this combination");
+                        }
+
+                        // Propagating-rune marker (0.5.4 carryover): the propagating
+                        // rune ICON(s) with a thin gold ring (replaces the old gold
+                        // dot) + the rune name(s). Purple name = rare ("valuable").
                         if (rw.propagatingCount > 0 && !rw.propagatingRunes.empty()) {
                             ImGui::SameLine(0.0f, 10.0f);
                             ImDrawList* rdl = ImGui::GetWindowDrawList();
                             const float  lh  = ImGui::GetTextLineHeight();
-                            const float  rad = lh * 0.26f;
                             const ImVec2 cp  = ImGui::GetCursorScreenPos();
-                            rdl->AddCircleFilled(ImVec2(cp.x + rad, cp.y + lh * 0.5f), rad,
-                                                 IM_COL32(255, 210, 60, 255));   // gold dot
-                            ImGui::Dummy(ImVec2(rad * 2.0f + 5.0f, lh));
+
+                            static const std::string kRsRunes = "Resources/runeshape/runes/";
+                            float px = cp.x;
+                            int   drawn = 0;
+                            // rw.propagatingRunes = "Power" / "Cold, Time" — split on ", ".
+                            for (size_t pos = 0; pos < rw.propagatingRunes.size(); ) {
+                                size_t comma = rw.propagatingRunes.find(", ", pos);
+                                std::string rn = rw.propagatingRunes.substr(
+                                    pos, comma == std::string::npos ? std::string::npos : comma - pos);
+                                pos = (comma == std::string::npos) ? rw.propagatingRunes.size() : comma + 2;
+                                const CurrencyTex* t = rn.empty() ? nullptr : GetItemTexture(kRsRunes + rn + ".png");
+                                if (!t || !t->valid) continue;
+                                rdl->AddImage(t->id, ImVec2(px, cp.y), ImVec2(px + lh, cp.y + lh));
+                                rdl->AddCircle(ImVec2(px + lh * 0.5f, cp.y + lh * 0.5f),
+                                               lh * 0.55f, IM_COL32(255, 210, 60, 220), 0, 1.2f);
+                                px += lh + 4.0f;
+                                ++drawn;
+                            }
+                            if (drawn == 0) {   // icons missing — legacy gold dot
+                                const float rad = lh * 0.26f;
+                                rdl->AddCircleFilled(ImVec2(cp.x + rad, cp.y + lh * 0.5f), rad,
+                                                     IM_COL32(255, 210, 60, 255));
+                                px = cp.x + rad * 2.0f;
+                            }
+                            ImGui::Dummy(ImVec2((px - cp.x) + 4.0f, lh));
                             ImGui::SameLine(0.0f, 0.0f);
                             const ImVec4 rcol = rw.propagatingHasRare
                                 ? ImVec4(0.80f, 0.52f, 1.0f, 1.0f)   // purple = rare / valuable
@@ -1770,6 +1915,7 @@ private:
                         }
                     }
                     ImGui::Unindent(kSquareSz + 4.0f);
+                    if (completed) ImGui::PopStyleVar();
                 }
 
                 ImGui::Spacing();
@@ -1789,13 +1935,33 @@ private:
     // them every frame.
     void ScanRuneshapeRows() {
         m_RuneshapeRows.clear();
-        if (!m_ShowRuneshapePrices) return;
+        if (!m_ShowRuneshapePrices && !m_ShowRuneshapeWeights) return;
 
         uintptr_t list = FindRuneshapeRowList();
         if (!list) return;
         // Panel-open gate: the runeshape window's own visible bit clears when the
         // panel is closed, even though the cached subtree (and row bits) persist.
         if (m_RuneshapeWindowAddr && !ctx()->Ui.IsVisible(m_RuneshapeWindowAddr)) return;
+
+        // (name-lower, qty, size) -> combo weights across all resolved stations
+        // (SDK). A row gets a weight only when its match is UNAMBIGUOUS: one
+        // distinct weight among the candidates that share the reward name, the
+        // quantity and (when countable) the symbol/recipe size — the panel rows
+        // carry rune symbols, not rune ids, so composition can't be read back.
+        auto toLowerAscii = [](std::string s) {
+            for (auto& ch : s) if (ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch + 32);
+            return s;
+        };
+        std::unordered_map<std::string, std::vector<std::array<int, 3>>> weightIdx;
+        if (m_ShowRuneshapeWeights) {
+            for (const auto& st : ctx()->Runeshape.Runeshapes()) {
+                for (const auto& rw : ctx()->Runeshape.Rewards(st.entityId)) {
+                    if (rw.name.empty()) continue;
+                    weightIdx[toLowerAscii(rw.name)].push_back(
+                        { rw.count, rw.recipeSize, rw.comboWeight });
+                }
+            }
+        }
 
         for (uintptr_t row : ctx()->Ui.GetChildren(list)) {
             // The list holds hundreds of rows; only the materialized ones carry the
@@ -1812,18 +1978,40 @@ private:
             int qty; std::string name;
             if (!ParseReward(text, qty, name)) continue;
 
-            PluginSDK::PriceResult price = CachedLookupPrice(name);
-            if (!price.found) continue;
-
-            float total = GetDisplayValue(price, m_DisplayCurrency) * qty;
-            if (total < 0.001f) continue;
-
             RuneshapeRow rr;
             rr.rowAddr = row;
             rr.labelAddr = label;
-            rr.total = total;
-            rr.chaos = price.chaos * qty;
-            rr.iconPath = price.iconPath;
+
+            if (m_ShowRuneshapePrices) {
+                PluginSDK::PriceResult price = CachedLookupPrice(name);
+                if (price.found) {
+                    float total = GetDisplayValue(price, m_DisplayCurrency) * qty;
+                    if (total >= 0.001f) {
+                        rr.total = total;
+                        rr.chaos = price.chaos * qty;
+                        rr.iconPath = price.iconPath;
+                    }
+                }
+            }
+
+            if (m_ShowRuneshapeWeights && !weightIdx.empty()) {
+                auto it = weightIdx.find(toLowerAscii(name));
+                if (it != weightIdx.end()) {
+                    const int symCount = CountRowSymbols(row);
+                    bool have = false, ambiguous = false;
+                    int  wval = 0;
+                    for (const auto& cand : it->second) {
+                        if (cand[0] != qty) continue;
+                        if (symCount > 0 && cand[1] > 0 && cand[1] != symCount) continue;
+                        if (!have)                 { have = true; wval = cand[2]; }
+                        else if (cand[2] != wval)  { ambiguous = true; break; }
+                    }
+                    if (have && !ambiguous) { rr.hasWeight = true; rr.weight = wval; }
+                }
+            }
+
+            // Keep the row only when it has something to draw.
+            if (rr.total < 0.001f && !rr.hasWeight) continue;
             m_RuneshapeRows.push_back(rr);
         }
     }
@@ -1878,13 +2066,37 @@ private:
             // No adaptive shrink: the price draws in the open gap beside the reward
             // text (not inside a tiny cell), so use the full configured size.
             float fontSize = baseFontSize;
-            PriceTag tag = MeasurePriceTag(r.total, fontSize,
-                m_ShowItemIcons ? r.iconPath : std::string());
-
             float gap = fontSize * 0.4f;
-            float labelX = x - tag.totalW - gap;
-            float labelY = y + (h - tag.totalH) * 0.5f;
-            DrawPriceTag(dl, fontSize, labelX, labelY, tag, r.chaos);
+            float rightEdge = x - gap;   // blocks stack right-to-left from the label
+
+            if (r.total >= 0.001f) {
+                PriceTag tag = MeasurePriceTag(r.total, fontSize,
+                    m_ShowItemIcons ? r.iconPath : std::string());
+                float labelX = rightEdge - tag.totalW;
+                float labelY = y + (h - tag.totalH) * 0.5f;
+                DrawPriceTag(dl, fontSize, labelX, labelY, tag, r.chaos);
+                rightEdge = labelX - gap * 0.75f;
+            }
+
+            // Combination weight badge, left of the price block (or where the
+            // price would be when the row is unpriced).
+            if (m_ShowRuneshapeWeights && r.hasWeight) {
+                char wbuf[16];
+                snprintf(wbuf, sizeof(wbuf), (r.weight > 0) ? "+%d" : "%d", r.weight);
+                const ImU32 wcol = (r.weight > 0) ? IM_COL32(110, 235, 110, 255)
+                                 : (r.weight < 0) ? IM_COL32(255, 110, 110, 255)
+                                                  : IM_COL32(205, 205, 205, 255);
+                const float ref   = ImGui::GetFontSize();
+                const float scale = (ref > 0.0f) ? (fontSize / ref) : 1.0f;
+                const ImVec2 ts0  = ImGui::CalcTextSize(wbuf);
+                const float wW = ts0.x * scale, wH = ts0.y * scale;
+                const float wx = rightEdge - wW;
+                const float wy = y + (h - wH) * 0.5f;
+                dl->AddRectFilled(ImVec2(wx - 2.0f, wy - 2.0f),
+                                  ImVec2(wx + wW + 2.0f, wy + wH + 2.0f),
+                                  IM_COL32(0, 0, 0, 200), 2.0f);
+                dl->AddText(ImGui::GetFont(), fontSize, ImVec2(wx, wy), wcol, wbuf);
+            }
         }
     }
 
@@ -1918,6 +2130,8 @@ private:
                 m_ShowRitualPrices = j["showRitualPrices"].get<bool>();
             if (j.contains("showRuneshapePrices") && j["showRuneshapePrices"].is_boolean())
                 m_ShowRuneshapePrices = j["showRuneshapePrices"].get<bool>();
+            if (j.contains("showRuneshapeWeights") && j["showRuneshapeWeights"].is_boolean())
+                m_ShowRuneshapeWeights = j["showRuneshapeWeights"].get<bool>();
             if (j.contains("showItemIcons") && j["showItemIcons"].is_boolean())
                 m_ShowItemIcons = j["showItemIcons"].get<bool>();
             if (j.contains("showRuneshapeWindow") && j["showRuneshapeWindow"].is_boolean())
@@ -1965,6 +2179,7 @@ private:
     bool m_ShowOtherInventoryPrices = false;  // Off by default — minor frame-time impact
     bool m_ShowRitualPrices = true;           // On by default — Ritual "Favours" shop pricing
     bool m_ShowRuneshapePrices = true;        // On by default — Runeshape Combinations reward pricing
+    bool m_ShowRuneshapeWeights = true;       // On by default — total rune weight per combination (host RuneShape tab weights)
     bool m_ShowItemIcons = true;              // On by default — item icon left of price tag
     bool m_HideWhenUnfocused = true;
     int m_HideHotkey = 0;
@@ -2078,6 +2293,10 @@ private:
         float total = 0;            // display-currency value (unit * qty)
         float chaos = 0;            // chaos value (unit * qty), for color
         std::string iconPath;       // item icon path (from PriceIconCache)
+        // Total rune weight of this row's combination (SDK comboWeight), set
+        // only when the (name, qty, symbol-count) match is unambiguous.
+        int  weight = 0;
+        bool hasWeight = false;
     };
     std::vector<RuneshapeRow> m_RuneshapeRows;
 

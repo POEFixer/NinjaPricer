@@ -2430,6 +2430,19 @@ struct Runeshape {
     int         rewardCount = 0;
     int         bestIndex   = -1;
     std::vector<int> propagatingSlots;  // slot(s) whose rune propagates (0.5.4)
+    // Best recipe-combination weight at this station (user per-rune weights,
+    // Radar -> RuneShape tab; 0 when the user has no weights configured).
+    int         comboWeight = 0;
+    // Anchor rune identity: Expedition2Runes row index (-1 = anchor-less
+    // unique station) and the anchor's slot position (0-based).
+    int         anchorRuneIdx = -1;
+    int         anchorPos     = 0;
+    // Collected or broken/unavailable — the host hides it on the radar;
+    // overlays should gray it out.
+    bool        completed     = false;
+    // Per-slot rune indices of the best-priced recipe (empty = unknown; show
+    // just the anchor rune in its slot). -1 entries = empty slots.
+    std::vector<int> bestRunes;
 };
 
 // One reward slot for a Runeshape device.
@@ -2443,6 +2456,11 @@ struct RuneshapeReward {
     std::string propagatingRunes;            // e.g. "Power" / "Cold, Time"; "" if none
     int         propagatingCount   = 0;
     bool        propagatingHasRare = false;  // any propagating rune is rare ("purple")
+    // Combination weight of THIS recipe: sum of the user's per-rune weights
+    // over its slots (Radar -> RuneShape tab).
+    int         comboWeight        = 0;
+    // Number of rune slots in this recipe (recipe size).
+    int         recipeSize         = 0;
 };
 
 // Runeshape devices and their per-entity reward lists.
@@ -2475,6 +2493,12 @@ public:
                 r.bestIndex  = a->best_index;
                 for (int i = 0; i < a->propagating_slot_count && i < 4; ++i)
                     r.propagatingSlots.push_back(a->propagating_slots[i]);
+                r.comboWeight   = a->combo_weight;
+                r.anchorRuneIdx = a->anchor_rune_idx;
+                r.anchorPos     = a->anchor_pos;
+                r.completed     = a->completed != 0;
+                for (int i = 0; i < a->best_rune_count && i < 12; ++i)
+                    r.bestRunes.push_back(a->best_runes[i]);
                 p->out->push_back(std::move(r));
                 return 1;
             },
@@ -2500,6 +2524,8 @@ public:
                 r.propagatingRunes   = a->propagating_runes;  // NUL-terminated
                 r.propagatingCount   = a->propagating_count;
                 r.propagatingHasRare = a->propagating_has_rare != 0;
+                r.comboWeight        = a->combo_weight;
+                r.recipeSize         = a->recipe_size;
                 p->out->push_back(std::move(r));
                 return 1;
             },

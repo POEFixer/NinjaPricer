@@ -879,6 +879,9 @@ typedef struct {
     char    propagating_runes[64];  // rune(s) at this recipe's propagating slot(s); "" if none
     int32_t propagating_count;      // number of propagating runes for this reward
     int32_t propagating_has_rare;   // 1 if any propagating rune is rare (idx 23-32)
+    // --- APPEND-ONLY (rune weights) ---
+    int32_t combo_weight;           // sum of user per-rune weights over this recipe's slots
+    int32_t recipe_size;            // number of rune slots in this recipe
 } RuneshapeRewardAbi;
 
 typedef struct {
@@ -892,6 +895,16 @@ typedef struct {
     // --- APPEND-ONLY (rune propagation, 0.5.4) ---
     int32_t  propagating_slots[4];   // raw propagating slot indices; unused entries = -1
     int32_t  propagating_slot_count; // number of valid entries in propagating_slots (0..4)
+    // --- APPEND-ONLY (rune weights) ---
+    int32_t  combo_weight;           // best recipe-combination weight at this station
+    // --- APPEND-ONLY (anchor rune identity) ---
+    int32_t  anchor_rune_idx;        // Expedition2Runes row of the anchor rune; -1 = anchor-less unique
+    int32_t  anchor_pos;             // anchor slot position (0-based, < hole_count)
+    // --- APPEND-ONLY (completion state) ---
+    int32_t  completed;              // 1 = collected or broken/unavailable (host hides it on the radar)
+    // --- APPEND-ONLY (best recipe composition) ---
+    int32_t  best_rune_count;        // valid entries in best_runes (0 = unknown, show anchor only)
+    int32_t  best_runes[12];         // per-slot rune idx of the best-priced recipe; -1 = empty slot
 } RuneshapeAbi;
 
 typedef int32_t (*PsdkRuneshapeVisitorFn)(const RuneshapeAbi*, void*);
