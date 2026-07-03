@@ -1284,6 +1284,13 @@ public:
     int GetGold() const {
         return (m_host && m_host->get_gold) ? m_host->get_gold() : 0;
     }
+
+    // Host Radar -> RuneShape "Show weights on map" toggle. Defaults to TRUE on
+    // hosts that predate the tail function (keeps legacy chip behaviour).
+    bool RuneshapeWeightsShown() const {
+        return !m_host || !m_host->get_runeshape_weights_shown ||
+               m_host->get_runeshape_weights_shown() != 0;
+    }
 };
 
 // Enumerate / look up entities; Watch() keeps a component map fresh across

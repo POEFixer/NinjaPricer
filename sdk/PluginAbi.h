@@ -1021,6 +1021,12 @@ typedef struct HostAbi {
     // many same-pathed VisibleServerGroundEffect entities. Append-only tail
     // (2026-06-25).
     int32_t (*read_ground_effect)(uintptr_t entity_addr, GroundEffectAbi* out);
+
+    // Whether the host Radar -> RuneShape "Show weights on map" toggle is ON.
+    // Overlay plugins gate their rune-weight chips on it so weight display
+    // follows the one host-side switch. Returns 0/1. Append-only tail
+    // (2026-07-03).
+    int32_t (*get_runeshape_weights_shown)(void);
 } HostAbi;
 
 #ifdef __cplusplus

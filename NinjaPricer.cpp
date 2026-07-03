@@ -845,12 +845,20 @@ private:
         }
     }
 
+    // Overlay draw list: the price/weight chips draw over the game normally,
+    // but drop BEHIND the Fixer menu while it is open (background list sits
+    // under all ImGui windows) so they never cover the UI.
+    ImDrawList* OverlayDrawList() {
+        return ctx()->Game.IsMenuVisible() ? ImGui::GetBackgroundDrawList()
+                                           : ImGui::GetForegroundDrawList();
+    }
+
     // Per-frame render of the cached ground tags. No memory reads — only
     // WorldToScreen (the camera pans every frame, so screen pos must refresh) +
     // measure + draw.
     void DrawGroundTags() {
         if (m_GroundTags.empty()) return;
-        ImDrawList* dl = ImGui::GetForegroundDrawList();
+        ImDrawList* dl = OverlayDrawList();
         float baseFontSize = ImGui::GetFontSize() * m_TextScale;
         if (ImGui::GetFontSize() <= 0.f) return;
 
@@ -880,7 +888,7 @@ private:
     // ========================================================================
 
     void DrawInventoryGrid(const PluginSDK::Inventory& inv) {
-        ImDrawList* dl = ImGui::GetForegroundDrawList();
+        ImDrawList* dl = OverlayDrawList();
         float baseFontSize = ImGui::GetFontSize() * m_TextScale;
 
         for (const auto& item : inv.Items) {
@@ -1619,8 +1627,17 @@ private:
 
         // Begin returns false when the window is collapsed — still save pos +
         // the collapsed state, then bail (the title bar remains interactive).
-        const bool open = ImGui::Begin("Runeshape###RuneshapeWindow", nullptr, flags);
+        // Title-bar X closes the window: re-enable via the "Runeshape window"
+        // checkbox in the plugin settings.
+        bool keepOpen = true;
+        const bool open = ImGui::Begin("Runeshape###RuneshapeWindow", &keepOpen, flags);
         m_RuneshapeWinCollapsed = !open;
+        if (!keepOpen) {
+            m_ShowRuneshapeWindow = false;
+            SaveSettings();
+            ImGui::End();
+            return;
+        }
         {
             ImVec2 wp = ImGui::GetWindowPos();
             if (wp.x != m_RuneshapeWinX || wp.y != m_RuneshapeWinY) {
@@ -2051,8 +2068,13 @@ private:
         }
         if (clipX1 <= clipX0 || clipY1 <= clipY0) return;
 
-        ImDrawList* dl = ImGui::GetForegroundDrawList();
+        ImDrawList* dl = OverlayDrawList();
         float baseFontSize = ImGui::GetFontSize() * m_TextScale;
+
+        // Weight chips follow the HOST Radar->RuneShape "Show weights" toggle
+        // (one switch controls the map badge and these chips) AND the plugin's
+        // own checkbox.
+        const bool weightsShown = m_ShowRuneshapeWeights && ctx()->Game.RuneshapeWeightsShown();
 
         for (const auto& r : m_RuneshapeRows) {
             if (!ctx()->Ui.IsVisible(r.rowAddr)) continue;
@@ -2080,7 +2102,7 @@ private:
 
             // Combination weight badge, left of the price block (or where the
             // price would be when the row is unpriced).
-            if (m_ShowRuneshapeWeights && r.hasWeight) {
+            if (weightsShown && r.hasWeight) {
                 char wbuf[16];
                 snprintf(wbuf, sizeof(wbuf), (r.weight > 0) ? "+%d" : "%d", r.weight);
                 const ImU32 wcol = (r.weight > 0) ? IM_COL32(110, 235, 110, 255)
