@@ -1027,6 +1027,15 @@ typedef struct HostAbi {
     // follows the one host-side switch. Returns 0/1. Append-only tail
     // (2026-07-03).
     int32_t (*get_runeshape_weights_shown)(void);
+
+    // Raw WorldArea id of the current zone (e.g. "Sanctum_1",
+    // "Sanctum_2_Foyer_1"). Carries the Trial-of-the-Sekhemas FLOOR number even
+    // when room content is hidden on the map (relic "The Burden of Leadership"),
+    // where the localized display name and the numeric hash do not. Writes a
+    // NUL-terminated UTF-8 string into `out` (truncated to out_size); returns the
+    // length written (excl. NUL), or 0 if unavailable. Append-only tail
+    // (2026-07-06).
+    int32_t (*get_area_id)(char* out, int32_t out_size);
 } HostAbi;
 
 #ifdef __cplusplus

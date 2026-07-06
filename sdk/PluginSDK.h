@@ -1291,6 +1291,17 @@ public:
         return !m_host || !m_host->get_runeshape_weights_shown ||
                m_host->get_runeshape_weights_shown() != 0;
     }
+
+    // Raw WorldArea id of the current zone (e.g. "Sanctum_1", "Sanctum_2_Foyer_1").
+    // Carries the Trial-of-the-Sekhemas floor number even when room content is
+    // hidden on the map. Empty on hosts that predate the tail function, off-trial,
+    // or when not in game.
+    std::string GetAreaId() const {
+        if (!m_host || !m_host->get_area_id) return std::string();
+        char buf[128];
+        int n = m_host->get_area_id(buf, static_cast<int>(sizeof(buf)));
+        return (n > 0) ? std::string(buf, static_cast<size_t>(n)) : std::string();
+    }
 };
 
 // Enumerate / look up entities; Watch() keeps a component map fresh across
