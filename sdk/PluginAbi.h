@@ -110,6 +110,10 @@ typedef enum {
     PSDK_GAME_STATE_DELETE_CHARACTER    = 10,
     PSDK_GAME_STATE_LOADING             = 11,
     PSDK_GAME_STATE_NOT_LOADED          = 12,
+    // PoE2 0.5.x grew a 13th engine state slot (host GameStateTypes::UnknownState).
+    // Appended at the tail — NOT_LOADED stays 12 so already-compiled plugins keep
+    // reading the not-loaded sentinel at its historical value (append-only ABI).
+    PSDK_GAME_STATE_UNKNOWN             = 13,
 } PsdkGameState;
 
 // Event kinds for EventsService::subscribe.
@@ -915,6 +919,176 @@ typedef struct {
     void (*enumerate_rewards)(uint64_t entity_id, PsdkRuneshapeRewardVisitorFn cb, void* ud);
 } RuneshapeServiceAbi;
 
+// ---- Atlas service ----------------------------------------------------------
+// Live endgame-atlas panel data (nodes / per-anchor adjacency / selection
+// vectors / Rite line seed / eligibility weights), read host-side through the
+// GameLibrary atlas offsets — the same single source the built-in Atlas
+// overlay uses — so atlas plugins (ForetoldRewards) need no raw memory reads.
+// Every call resolves the panel fresh (mouse UI path, controller hint
+// fallback) and yields nothing when the panel is absent.
+
+// Per-node detail mask for enumerate_nodes. BASIC costs ONE bulk read for the
+// whole node vector; RECORD/UISTATE add one small read per node and NAME a
+// multi-hop string walk per node — request only what the call site needs.
+typedef enum {
+    PSDK_ATLAS_NODE_BASIC   = 0,        // grid + ui_addr + extra_addr only
+    PSDK_ATLAS_NODE_RECORD  = 1 << 0,   // + marker / flags (ExtraPtr record)
+    PSDK_ATLAS_NODE_UISTATE = 1 << 1,   // + biome / map_state (node UI element)
+    PSDK_ATLAS_NODE_NAME    = 1 << 2,   // + name (WorldAreas row walk — expensive)
+    PSDK_ATLAS_NODE_ALL     = 0x7,
+} PsdkAtlasNodeDetail;
+
+typedef struct {
+    int32_t   grid_x;           // AtlasNodes grid coords — stable per map (node
+    int32_t   grid_y;           //   ADDRESSES churn every frame; grids do not)
+    uintptr_t ui_addr;          // node UI widget (screen-rect target); may be 0
+    uintptr_t extra_addr;       // per-node data record (marker/flags home); may be 0
+    uint32_t  marker;           // RECORD: Rite line-map type. 0 = not a line map /
+                                //   entry not yet loaded; 0x47B = line map with NO
+                                //   foretold reward; other non-zero = reward map
+    uint32_t  flags;            // RECORD: bit0 = AccessibleNow, bit1 = Completed
+    int32_t   biome;            // UISTATE: EndGameMapBiomes _rid (9 = Breach Stronghold)
+    int32_t   map_state;        // UISTATE: low 2 bits; bit1 = completed ("Map Attempted")
+    char      name[64];         // NAME: UTF-8 display name; "" when unresolved
+} AtlasNodeAbi;
+
+// One per-anchor adjacency entry (the Rite "conn table"). Slot ORDER is
+// preserved and meaningful: the reward fn's neighbour rank derives from it.
+typedef struct {
+    int32_t key_x, key_y;       // anchor map grid
+    int32_t neighbor_count;     // valid entries below (0..5); unused slots dropped
+    int32_t neighbor_x[5];
+    int32_t neighbor_y[5];
+} AtlasConnAbi;
+
+typedef struct { int32_t x, y; } AtlasGridAbi;                 // one selection-vector grid
+typedef struct { int32_t key; int32_t value; } AtlasWeightAbi; // one RAW weight row (keys repeat — dedup-sum client-side)
+
+typedef int32_t (*PsdkAtlasNodeVisitorFn)(const AtlasNodeAbi*, void*);
+typedef int32_t (*PsdkAtlasConnVisitorFn)(const AtlasConnAbi*, void*);
+typedef int32_t (*PsdkAtlasGridVisitorFn)(const AtlasGridAbi*, void*);
+typedef int32_t (*PsdkAtlasWeightVisitorFn)(const AtlasWeightAbi*, void*);
+
+typedef struct {
+    // --- FROZEN (2026-07-07): `HostAbi::sekhema` was appended after
+    //     `HostAbi::atlas`, so appending here would shift it. Extend via new
+    //     HostAbi tail functions instead. ---
+    // Atlas panel address (0 = panel absent / not in game). Also usable as the
+    // panel-change signal: stable while the panel object lives.
+    uintptr_t (*get_panel)(void);
+    // Visit every atlas node. detail = PsdkAtlasNodeDetail bit mask.
+    void (*enumerate_nodes)(int32_t detail, PsdkAtlasNodeVisitorFn cb, void* ud);
+    // Visit the per-anchor adjacency table (Rite line connectivity; viewport-
+    // dependent — it grows/shrinks with the loaded atlas region).
+    void (*enumerate_connections)(PsdkAtlasConnVisitorFn cb, void* ud);
+    // Visit a selection vector: which = 0 -> A (revealed Rite-line "purple"
+    // maps), which = 1 -> B (selected anchors, in pick order).
+    void (*get_selection)(int32_t which, PsdkAtlasGridVisitorFn cb, void* ud);
+    // Rite reward-selection seed (non-zero only while a Rite line is active on
+    // the open atlas). Returns 1 + writes *out when the panel resolved, else 0.
+    int32_t (*get_line_seed)(uint32_t* out);
+    // Visit the raw eligibility-weight rows (panel -> server data -> gold data
+    // -> weights vector). The path-cap stat id is key 26379 (0.5.4).
+    void (*enumerate_weights)(PsdkAtlasWeightVisitorFn cb, void* ud);
+    // Resolve one node's display name (ui_addr = AtlasNodeAbi::ui_addr) into a
+    // UTF-8 buffer — the cheap lazy alternative to PSDK_ATLAS_NODE_NAME.
+    // Returns the length written (excl. NUL), or 0 when unresolved.
+    int32_t (*get_node_name)(uintptr_t ui_addr, char* out, int32_t out_size);
+} AtlasServiceAbi;
+
+// ---- Sekhema service --------------------------------------------------------
+// Trial of the Sekhemas floor-map data (FloorData room graph / choices /
+// content FK rows) plus the StateMachine flag reads trial objects need, read
+// host-side through the GameLibrary SekhemaTrial / DatTable / StateMachine
+// offsets — so trial plugins (SekhemaHelper) carry no raw memory offsets.
+// The graph calls take the trial panel UI address explicitly: plugins keep
+// their own panel discovery (UI paths / BFS probing via probe_floor), or use
+// get_panel for the host's direct child-index resolution. The fail-closed
+// bounds live host-side: layers/rooms accepted in [1,64]/[0,64], connections
+// capped at 16, content entries at 512.
+
+// Floor header: dynamic per-run state (one get_floor call) + the per-layer
+// room counts of the static graph. layer_count trusts room_counts/choices up
+// to 64 entries.
+typedef struct {
+    int32_t   valid;            // 1 = FloorData resolved (layer_count in [1, 64])
+    int32_t   layer_count;
+    uintptr_t floor_data;       // resolved FloorData base (change/diagnostic signal)
+    int32_t   room_counts[64];  // rooms per layer
+    uint8_t   choices[64];      // per-layer chosen room index; 0xFF = none
+    uint8_t   counter;          // raw counter byte; (counter & 7) = choices made
+    uint8_t   _pad[7];
+} SekhemaFloorAbi;
+
+// One room of the static floor graph (immutable for a whole floor).
+typedef struct {
+    int32_t layer;              // 0-based layer index
+    int32_t index;              // room index within its layer
+    int32_t connection_count;   // valid entries below (0..16)
+    uint8_t connections[16];    // room indices in the NEXT layer
+} SekhemaRoomAbi;
+
+// One resolved content FK pair. Both strings are resolved unconditionally;
+// dispatch on table_path and read only the field meaningful for that table
+// (SanctumRooms -> row_id, SanctumPersistentEffects -> row_name) — the other
+// may hold noise where the row layout differs. All strings UTF-8, truncated.
+typedef struct {
+    uintptr_t row_addr;         // DAT row object (identity/change signal)
+    uintptr_t table_addr;       // DAT table object
+    char      table_path[128];  // in-memory .dat table path ("" unreadable)
+    char      row_id[96];       // row Id (row+0x00; e.g. "Caverns_Arena_03")
+    char      row_name[160];    // display name (row+0x28; localized)
+} SekhemaContentFkAbi;
+
+// One content entry: which (layer, room) it decorates + its FK pairs. The
+// target bytes are delivered as read — bounds-check against the graph before
+// joining (entries can reference hidden/out-of-range rooms).
+typedef struct {
+    int32_t layer;
+    int32_t room_index;
+    int32_t fk_count;           // valid entries in fks (0..3), compacted
+    int32_t _pad;
+    SekhemaContentFkAbi fks[3];
+} SekhemaContentAbi;
+
+typedef int32_t (*PsdkSekhemaRoomVisitorFn)(const SekhemaRoomAbi*, void*);
+typedef int32_t (*PsdkSekhemaContentVisitorFn)(const SekhemaContentAbi*, void*);
+
+typedef struct {
+    // --- APPEND ONLY: add new functions at the END, never reorder. Valid only
+    //     while `HostAbi::sekhema` stays the LAST HostAbi member; after that the
+    //     struct is frozen — extend via new HostAbi tail functions instead. ---
+    // Host-resolved trial panel (GameUI child[84], gated on a non-null floor-obj
+    // pointer). 0 = absent / controller mode / not in game.
+    uintptr_t (*get_panel)(void);
+    // Cheap probe (~6 reads): does ui_addr resolve a FloorData whose layer
+    // vector counts in [1, 64]? Returns the layer count, 0 = not a trial floor.
+    // Intended as the per-node pre-filter for plugin-side panel BFS.
+    int32_t (*probe_floor)(uintptr_t ui_addr);
+    // Floor header (see SekhemaFloorAbi). Returns 1 + fills *out when a
+    // FloorData resolves from panel_addr (with the panel-parent fallback),
+    // else 0 with *out zeroed.
+    int32_t (*get_floor)(uintptr_t panel_addr, SekhemaFloorAbi* out);
+    // Visit every room of the static floor graph in (layer, index) order.
+    void (*enumerate_rooms)(uintptr_t panel_addr, PsdkSekhemaRoomVisitorFn cb, void* ud);
+    // Visit every content entry (FK rows resolved to id/name strings).
+    void (*enumerate_content)(uintptr_t panel_addr, PsdkSekhemaContentVisitorFn cb, void* ud);
+    // StateMachine used/collected/closed flag (first byte past the component
+    // header; crystals/levers/portals/chest-likes). Returns 1 + writes *out_used
+    // (0 active / 1 used) when state_machine_addr != 0 and the host is attached.
+    int32_t (*get_room_used_flag)(uintptr_t state_machine_addr, int32_t* out_used);
+    // One shared-state VALUE from a StateMachine's values vector (8 bytes per
+    // define_shared_state entry, define order — door open/activate states).
+    // Returns 1 + writes *out_value; 0 when the vector is empty/oversized (>64)
+    // or index is out of range.
+    int32_t (*get_state_machine_value)(uintptr_t state_machine_addr, int32_t index,
+                                       uint64_t* out_value);
+    // A UI element's StringId StdWString as UTF-8 — the field trial-HUD leaves
+    // render their numbers into (NOT the get_text field). Returns the length
+    // written (excl. NUL), or 0 when empty/unreadable.
+    int32_t (*get_ui_string_id)(uintptr_t ui_addr, char* out, int32_t out_size);
+} SekhemaServiceAbi;
+
 // The root table handed to every plugin. version must equal PLUGIN_SDK_VERSION;
 // trust a field only when size_bytes covers it. Everything below d3d_device is
 // an APPEND-ONLY tail — add new host functions here, never in the middle.
@@ -1036,6 +1210,28 @@ typedef struct HostAbi {
     // length written (excl. NUL), or 0 if unavailable. Append-only tail
     // (2026-07-06).
     int32_t (*get_area_id)(char* out, int32_t out_size);
+
+    // Genesis-tree (Hiveblood) resource counter. Host walks the pattern-anchored
+    // chain (GameOffsets::Objects::Hiveblood). Returns 1 + writes *out on success,
+    // 0 when not in game / chain broken. Append-only tail (2026-07-07).
+    int32_t (*get_hiveblood)(int32_t* out);
+
+    // Live endgame-atlas panel data (nodes / adjacency / selection / line seed /
+    // weights / node names), read host-side via the GameLibrary atlas offsets.
+    // Embedded by-value: FROZEN since `sekhema` was appended after it —
+    // extensions must land as new HostAbi tail functions (the UiServiceAbi /
+    // compute_screen_rects lesson). Append-only tail (2026-07-07, after
+    // get_hiveblood).
+    AtlasServiceAbi atlas;
+
+    // Trial of the Sekhemas floor-map data (room graph / choices / content FK
+    // rows) + StateMachine flag reads, read host-side via the GameLibrary
+    // SekhemaTrial offsets. Embedded by-value: appending inside
+    // SekhemaServiceAbi is safe ONLY while it is the LAST HostAbi member; the
+    // moment anything is appended after it, the struct is frozen and extensions
+    // must land as new HostAbi tail functions. Append-only tail (2026-07-07,
+    // after atlas).
+    SekhemaServiceAbi sekhema;
 } HostAbi;
 
 #ifdef __cplusplus

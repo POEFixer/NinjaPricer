@@ -39,12 +39,6 @@
 // kRitualShopInventoryId.
 static constexpr int kRitualShopInventoryId = 10001;
 
-// UI element StringId offset (0.5.0). Read directly via the Memory service:
-// the host's ctx()->Ui.GetStringId() bridge still uses the stale pre-0.5.0
-// 0x448 offset (Bridge_Ui.cpp), so it returns garbage on 0.5.x. Live-verified:
-// the StringId StdWString lives at +0x4c0.
-static constexpr uintptr_t kUiStringIdOffset = 0x4c0;
-
 // Price text position for UI items (inventory/stash)
 enum class UiPricePosition : int {
     TopLeft = 0,
@@ -1369,24 +1363,16 @@ private:
     // Runeshape Combinations overlay — UI tree helpers
     // ========================================================================
 
-    // ASCII-narrow a wide string. Reward StringIds are English/ASCII in memory.
-    static std::string RuneNarrow(const std::wstring& w) {
-        std::string s;
-        s.reserve(w.size());
-        for (wchar_t c : w) s += (c < 128) ? static_cast<char>(c) : '?';
-        return s;
-    }
-
     // Parent address of a UI element (0 on failure / invalid).
     uintptr_t UiParent(uintptr_t addr) {
         return addr ? ctx()->Ui.Read(addr).ParentAddress : 0;
     }
 
-    // Read a UI element's StringId (the StdWString at +0x4c0), narrowed to ASCII.
+    // Read a UI element's StringId via the host bridge (canonical StringIdPtr
+    // offset, host-narrowed to ASCII — identical to the old raw read).
     std::string ReadUiStringId(uintptr_t elemAddr) {
         if (!elemAddr) return std::string();
-        std::wstring ws = ctx()->Memory.ReadStdWString(elemAddr + kUiStringIdOffset);
-        return ws.empty() ? std::string() : RuneNarrow(ws);
+        return ctx()->Ui.GetStringId(elemAddr);
     }
 
     // Parse a reward label "Nx ItemName" -> {qty, name}; no "Nx " prefix -> {1, label}.
@@ -1430,7 +1416,7 @@ private:
     uintptr_t GetRowLabelElement(uintptr_t row) {
         if (!row) return 0;
         for (uintptr_t c : ctx()->Ui.GetChildren(row)) {
-            if (c && !ctx()->Memory.ReadStdWString(c + kUiStringIdOffset).empty())
+            if (c && !ctx()->Ui.GetStringId(c).empty())
                 return c;
         }
         return 0;
