@@ -1261,6 +1261,16 @@ public:
         return raw.area_change_counter;
     }
 
+    // Cheap town/hideout flag WITHOUT the per-entity enumeration that GetSnapshot()
+    // does in Snapshot::FromAbi (same pattern as GetAreaChangeCounter — the raw ABI
+    // fill copies only scalars + player/maps/vitals). Use it to gate map-content
+    // overlays every frame. false when not in game.
+    bool IsTownOrHideout() const {
+        SnapshotAbi raw{};
+        if (m_abi && m_abi->get_snapshot) m_abi->get_snapshot(&raw);
+        return raw.vitals.is_town_or_hideout != 0;
+    }
+
     GameState GetState() const {
         return static_cast<GameState>(
             (m_abi && m_abi->get_state) ? m_abi->get_state() : PSDK_GAME_STATE_NOT_LOADED);

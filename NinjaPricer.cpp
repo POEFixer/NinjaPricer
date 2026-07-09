@@ -590,7 +590,11 @@ public:
         // Finalize per-frame lookup peaks (after all draw paths contributed).
         if (m_PerfLookupMs > m_PerfPeakLookupMs) m_PerfPeakLookupMs = m_PerfLookupMs;
 
-        if (m_ShowRuneshapePrices || m_ShowRuneshapeWeights) {
+        // Runeshape is map-league content — none of its overlays belong in town or
+        // hideout (user request 2026-07-09). Cheap scalar read, no entity enumeration.
+        const bool inTownOrHideout = ctx()->Game.IsTownOrHideout();
+
+        if ((m_ShowRuneshapePrices || m_ShowRuneshapeWeights) && !inTownOrHideout) {
             auto nowR = std::chrono::steady_clock::now();
             // 400 ms refresh: when the panel is open the rebuild is cheap (cached
             // list, fast-path), so a tighter cadence just makes prices appear and
@@ -603,10 +607,11 @@ public:
             DrawRuneshapeOverlay();
         }
 
-        if (m_ShowRuneshapeWindow) {
+        if (m_ShowRuneshapeWindow && !inTownOrHideout) {
             DrawRuneshapeWindow();
         } else {
-            // Release the overlay-input request when the window is off.
+            // Release the overlay-input request when the window is off (or suppressed
+            // by the town/hideout gate).
             ctx()->Overlay.SetWantsOverlayInput(false);
         }
     }
