@@ -313,6 +313,51 @@ public:
         m_GroundPricePosition = static_cast<GroundPricePosition>(gndPos);
     }
 
+    // Hotkey capture row: "<label>  <binding>  [Set Hotkey] [Clear]". While this
+    // row is capturing (m_CaptureTarget == &vk) the next pressed key is bound;
+    // ESC cancels. One capture at a time across all rows by construction.
+    // Returns true when a key was bound THIS frame — the key is physically down
+    // at that moment, so callers can re-arm edge detectors against it.
+    bool DrawHotkeyCaptureRow(const char* label, const char* idSuffix, int& vk) {
+        bool boundNow = false;
+        ImGui::Text("%s", label);
+        ImGui::SameLine();
+        if (m_CaptureTarget == &vk) {
+            ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, 1.0f),
+                "Press any key... (ESC to cancel)");
+            if (GetAsyncKeyState(VK_ESCAPE) & 0x8000) {
+                m_CaptureTarget = nullptr;
+            }
+            else {
+                for (int k = 0x08; k < 0xFF; k++) {
+                    if (k == VK_LBUTTON || k == VK_RBUTTON || k == VK_MBUTTON) continue;
+                    if (k == VK_ESCAPE) continue;
+                    if (GetAsyncKeyState(k) & 0x8000) {
+                        vk = k;
+                        m_CaptureTarget = nullptr;
+                        boundNow = true;
+                        break;
+                    }
+                }
+            }
+        }
+        else {
+            ImGui::Text("%s", GetVkName(vk));
+            ImGui::SameLine();
+            char btn[48];
+            snprintf(btn, sizeof(btn), "Set Hotkey##%s", idSuffix);
+            if (ImGui::Button(btn, ImVec2(100.0f, 0.0f)))
+                m_CaptureTarget = &vk;
+            if (vk != 0) {
+                ImGui::SameLine();
+                snprintf(btn, sizeof(btn), "Clear##%s", idSuffix);
+                if (ImGui::Button(btn, ImVec2(60.0f, 0.0f)))
+                    vk = 0;
+            }
+        }
+        return boundNow;
+    }
+
     void DrawTabOverlayToggles() {
         ImGui::Spacing();
 
@@ -338,10 +383,58 @@ public:
         ImGui::SameLine();
         ImGui::TextDisabled("(movable overlay listing each Runeshape with prices)");
 
-        if (m_ShowRuneshapeWindow) {
+        // Advanced settings for the Runeshape window. Always visible (not gated
+        // on the checkbox above) so the toggle hotkey stays discoverable while
+        // the window is hidden.
+        ImGui::Indent();
+        if (ImGui::TreeNode("Runeshape window: advanced settings")) {
+            ImGui::Spacing();
+
+            if (DrawHotkeyCaptureRow("Show/hide hotkey:", "rswin", m_RuneshapeWinHotkey))
+                m_RuneshapeWinHotkeyWasDown = true;   // key is down right now — don't fire the toggle
+
+            ImGui::Checkbox("Hide on mouse hover", &m_RuneshapeWinHideOnHover);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("The overlay disappears while the mouse cursor is over it and\n"
+                                  "reappears when the cursor leaves. Not applied while the\n"
+                                  "Fixer menu is open (so it can still be dragged / collapsed).");
+
             ImGui::SetNextItemWidth(200.0f);
-            ImGui::SliderFloat("Runeshape window opacity", &m_RuneshapeWinAlpha, 0.1f, 1.0f, "%.2f");
+            ImGui::SliderFloat("Opacity##rswin", &m_RuneshapeWinAlpha, 0.1f, 1.0f, "%.2f");
+
+            ImGui::Spacing();
+            ImGui::Text("Price display:");
+            ImGui::SameLine();
+            int rsps = static_cast<int>(m_RuneshapeWinPriceStyle);
+            ImGui::RadioButton("Currency icon##rswin", &rsps, 0);
+            ImGui::SameLine();
+            ImGui::RadioButton("Text##rswin", &rsps, 1);
+            m_RuneshapeWinPriceStyle = static_cast<PriceDisplayStyle>(rsps);
+            ImGui::SameLine();
+            ImGui::TextDisabled("(reward rows + header best reward)");
+
+            ImGui::Spacing();
+            ImGui::TextDisabled("Header elements:");
+            ImGui::Checkbox("Color square", &m_RsShowHdrColor);
+            ImGui::SameLine();
+            ImGui::Checkbox("Rune sockets", &m_RsShowHdrRunes);
+            ImGui::SameLine();
+            ImGui::Checkbox("Best reward price", &m_RsShowHdrBest);
+
+            ImGui::TextDisabled("Expanded list elements:");
+            ImGui::Checkbox("Reward icon", &m_RsShowRowIcon);
+            ImGui::SameLine();
+            ImGui::Checkbox("Reward name", &m_RsShowRowName);
+            ImGui::SameLine();
+            ImGui::Checkbox("Reward quantity", &m_RsShowRowQty);
+            ImGui::Checkbox("Price##rswinrow", &m_RsShowRowPrice);
+            ImGui::SameLine();
+            ImGui::Checkbox("Propagating runes (yellow glow)", &m_RsShowRowPropRunes);
+
+            ImGui::Spacing();
+            ImGui::TreePop();
         }
+        ImGui::Unindent();
 
         ImGui::Checkbox("Runeshape weights", &m_ShowRuneshapeWeights);
         ImGui::SameLine();
@@ -353,38 +446,7 @@ public:
 
         ImGui::Separator();
 
-        ImGui::Text("Hold-to-hide hotkey:");
-        ImGui::SameLine();
-        if (m_CapturingHotkey) {
-            ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, 1.0f),
-                "Press any key... (ESC to cancel)");
-            if (GetAsyncKeyState(VK_ESCAPE) & 0x8000) {
-                m_CapturingHotkey = false;
-            }
-            else {
-                for (int vk = 0x08; vk < 0xFF; vk++) {
-                    if (vk == VK_LBUTTON || vk == VK_RBUTTON || vk == VK_MBUTTON) continue;
-                    if (vk == VK_ESCAPE) continue;
-                    if (GetAsyncKeyState(vk) & 0x8000) {
-                        m_HideHotkey = vk;
-                        m_CapturingHotkey = false;
-                        break;
-                    }
-                }
-            }
-        }
-        else {
-            ImGui::Text("%s", GetVkName(m_HideHotkey));
-            ImGui::SameLine();
-            if (ImGui::Button("Set Hotkey", ImVec2(100.0f, 0.0f))) {
-                m_CapturingHotkey = true;
-            }
-            if (m_HideHotkey != 0) {
-                ImGui::SameLine();
-                if (ImGui::Button("Clear", ImVec2(60.0f, 0.0f)))
-                    m_HideHotkey = 0;
-            }
-        }
+        DrawHotkeyCaptureRow("Hold-to-hide hotkey:", "hold", m_HideHotkey);
     }
 
     // ========================================================================
@@ -403,6 +465,19 @@ public:
         // entity list is the ground-item scan, which is throttled + cached below.
         if (!ctx()->Game.IsAttached()) return;
         if (!ctx()->Game.IsInGame()) return;
+
+        // Runeshape-window show/hide hotkey — edge-triggered on key press.
+        // Paused while a capture row is armed in the settings UI; right after a
+        // capture completes, m_RuneshapeWinHotkeyWasDown was set true, so the
+        // still-held freshly-bound key doesn't immediately toggle the window.
+        if (m_RuneshapeWinHotkey != 0 && m_CaptureTarget == nullptr) {
+            const bool down = (GetAsyncKeyState(m_RuneshapeWinHotkey) & 0x8000) != 0;
+            if (down && !m_RuneshapeWinHotkeyWasDown) {
+                m_ShowRuneshapeWindow = !m_ShowRuneshapeWindow;
+                SaveSettings();
+            }
+            m_RuneshapeWinHotkeyWasDown = down;
+        }
 
         uint64_t areaChange = ctx()->Game.GetAreaChangeCounter();
         if (areaChange != m_LastAreaChange) {
@@ -559,6 +634,17 @@ public:
             j["runeshapeWinAlpha"] = m_RuneshapeWinAlpha;
             j["runeshapeWinCollapsed"] = m_RuneshapeWinCollapsed;
             { nlohmann::json arr = nlohmann::json::array(); for (auto c : m_RuneshapeCollapsed) arr.push_back(c); j["runeshapeCollapsed"] = arr; }
+            j["rsWinToggleHotkey"] = m_RuneshapeWinHotkey;
+            j["rsWinHideOnHover"] = m_RuneshapeWinHideOnHover;
+            j["rsWinPriceStyle"] = static_cast<int>(m_RuneshapeWinPriceStyle);
+            j["rsWinShowColor"] = m_RsShowHdrColor;
+            j["rsWinShowRunes"] = m_RsShowHdrRunes;
+            j["rsWinShowBestReward"] = m_RsShowHdrBest;
+            j["rsWinShowRewardIcon"] = m_RsShowRowIcon;
+            j["rsWinShowRewardText"] = m_RsShowRowName;
+            j["rsWinShowRewardQty"] = m_RsShowRowQty;
+            j["rsWinShowRewardPrice"] = m_RsShowRowPrice;
+            j["rsWinShowPropRunes"] = m_RsShowRowPropRunes;
             j["hideWhenUnfocused"] = m_HideWhenUnfocused;
             j["hideHotkey"] = m_HideHotkey;
             j["uiPricePosition"] = static_cast<int>(m_UiPricePosition);
@@ -1586,6 +1672,21 @@ private:
 
         bool menuVisible = ctx()->Game.IsMenuVisible();
 
+        // Hide-on-hover: vanish while the cursor sits inside LAST frame's window
+        // rect. The remembered rect is deliberately kept while hidden (the
+        // window isn't submitted then, so it can't refresh) — the window stays
+        // gone until the cursor leaves that area, preventing show/hide flicker.
+        // Never applied while the Fixer menu is open, so the window can still be
+        // configured, dragged and collapsed from the menu.
+        if (m_RuneshapeWinHideOnHover && !menuVisible && m_RuneshapeWinRectValid) {
+            const ImVec2 mp = ImGui::GetIO().MousePos;
+            if (mp.x >= m_RuneshapeWinRectMin.x && mp.x < m_RuneshapeWinRectMax.x &&
+                mp.y >= m_RuneshapeWinRectMin.y && mp.y < m_RuneshapeWinRectMax.y) {
+                ctx()->Overlay.SetWantsOverlayInput(false);
+                return;
+            }
+        }
+
         // Render only when there's something to show or the menu is open.
         // While rendered, request interactive overlay input so the title-bar
         // header can be dragged / collapsed even in pure overlay mode: the host
@@ -1618,6 +1719,17 @@ private:
         bool keepOpen = true;
         const bool open = ImGui::Begin("Runeshape###RuneshapeWindow", &keepOpen, flags);
         m_RuneshapeWinCollapsed = !open;
+
+        // Remember the on-screen rect (collapsed => title bar only) for the
+        // hide-on-hover check above — it runs BEFORE Begin() next frame.
+        {
+            const ImVec2 wp = ImGui::GetWindowPos();
+            const ImVec2 ws = ImGui::GetWindowSize();
+            m_RuneshapeWinRectMin = wp;
+            m_RuneshapeWinRectMax = ImVec2(wp.x + ws.x, wp.y + ws.y);
+            m_RuneshapeWinRectValid = true;
+        }
+
         if (!keepOpen) {
             m_ShowRuneshapeWindow = false;
             SaveSettings();
@@ -1658,10 +1770,11 @@ private:
                 const float lineH = ImGui::GetTextLineHeight();
                 const float slotSz  = lineH;                 // compact socket, one line tall
                 const float slotGap = 3.0f;
-                const float dotsW = (r.holeCount > 0)
+                const float dotsW = (m_RsShowHdrRunes && r.holeCount > 0)
                     ? (r.holeCount * slotSz + (r.holeCount - 1) * slotGap) : 0.0f;
 
-                bool  bestPriced = (r.bestIndex >= 0 &&
+                bool  bestPriced = m_RsShowHdrBest &&
+                                   (r.bestIndex >= 0 &&
                                     r.bestIndex < static_cast<int>(rewards.size()) &&
                                     rewards[r.bestIndex].priced);
                 float bestDisplay = 0.0f;
@@ -1670,7 +1783,10 @@ private:
                 float priceW = 0.0f;
                 if (bestPriced) {
                     bestDisplay = ChaosToDisplay(rewards[r.bestIndex].totalChaos, divInChaos, exInChaos);
-                    ctex = GetCurrencyTexture(m_DisplayCurrency);
+                    // Shared price style: icon+number, or plain text ("2.5 D").
+                    // Text is also the fallback when the icon texture is missing.
+                    ctex = (m_RuneshapeWinPriceStyle == PriceDisplayStyle::Image)
+                         ? GetCurrencyTexture(m_DisplayCurrency) : nullptr;
                     if (ctex && ctex->valid) {
                         bestNum = FormatPriceNumberLocal(bestDisplay);
                         const float iw = lineH * (ctex->h ? static_cast<float>(ctex->w) / static_cast<float>(ctex->h) : 1.0f);
@@ -1703,15 +1819,17 @@ private:
 
                 // — colored square (vertically centered on the framed header) —
                 ImDrawList* dl = ImGui::GetWindowDrawList();
-                const float frameH = ImGui::GetFrameHeight();
-                const float sqYOff = (frameH > kSquareSz) ? (frameH - kSquareSz) * 0.5f : 0.0f;
-                ImVec2 p = ImGui::GetCursorScreenPos();
-                dl->AddRectFilled(ImVec2(p.x, p.y + sqYOff),
-                                  ImVec2(p.x + kSquareSz, p.y + sqYOff + kSquareSz),
-                                  completed ? IM_COL32(120, 120, 120, 255)
-                                            : static_cast<ImU32>(r.color), 2.0f);
-                ImGui::Dummy(ImVec2(kSquareSz, frameH));
-                ImGui::SameLine();
+                if (m_RsShowHdrColor) {
+                    const float frameH = ImGui::GetFrameHeight();
+                    const float sqYOff = (frameH > kSquareSz) ? (frameH - kSquareSz) * 0.5f : 0.0f;
+                    ImVec2 p = ImGui::GetCursorScreenPos();
+                    dl->AddRectFilled(ImVec2(p.x, p.y + sqYOff),
+                                      ImVec2(p.x + kSquareSz, p.y + sqYOff + kSquareSz),
+                                      completed ? IM_COL32(120, 120, 120, 255)
+                                                : static_cast<ImU32>(r.color), 2.0f);
+                    ImGui::Dummy(ImVec2(kSquareSz, frameH));
+                    ImGui::SameLine();
+                }
 
                 // — collapsible header (per-Runeshape; ###id keyed by color so the
                 //   collapsed state persists across maps and sessions) —
@@ -1747,7 +1865,7 @@ private:
                     //    fallback when no recipe resolved), golden RunePropagation
                     //    crown over the propagating slot(s). Falls back to circles
                     //    when the art is missing.
-                    {
+                    if (m_RsShowHdrRunes) {
                         static const std::string kRsUi    = "Resources/runeshape/ui/";
                         static const std::string kRsRunes = "Resources/runeshape/runes/";
                         // Expedition2Runes row -> name (mirrors expedition2_recipes.json).
@@ -1833,37 +1951,81 @@ private:
                     }
                 }
 
-                // — reward rows (only when expanded); dimmed for a cleared station —
-                if (open && !rewards.empty()) {
+                // — reward rows (only when expanded); dimmed for a cleared
+                //   station. Each row is assembled from toggleable segments:
+                //   [icon] [name + qty (+ text-style price)] [image-style price]
+                //   [weight] [propagating runes]. SameLine runs BEFORE a segment
+                //   (never after it), so a hidden tail can't leak the cursor
+                //   onto the next row's line. Weight chips are governed by the
+                //   separate "Runeshape weights" checkbox, so they keep the rows
+                //   alive even with every per-element toggle off.
+                const bool anyRowElement = m_RsShowRowIcon || m_RsShowRowName ||
+                                           m_RsShowRowQty || m_RsShowRowPrice ||
+                                           m_RsShowRowPropRunes || m_ShowRuneshapeWeights;
+                if (open && !rewards.empty() && anyRowElement) {
                     if (completed) ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.5f);
                     ImGui::Indent(kSquareSz + 4.0f);
+                    // Currency icon for the image price style (null => text style;
+                    // also the fallback when the icon texture is missing).
+                    const CurrencyTex* rowCTex =
+                        (m_RuneshapeWinPriceStyle == PriceDisplayStyle::Image)
+                        ? GetCurrencyTexture(m_DisplayCurrency) : nullptr;
                     for (const auto& rw : rewards) {
-                        char row[256];
-                        if (rw.priced) {
-                            float displayVal = ChaosToDisplay(rw.totalChaos, divInChaos, exInChaos);
-                            std::string priceStr = FormatPriceLocal(displayVal, m_DisplayCurrency);
-                            if (m_ShowItemIcons) {
-                                auto pr = CachedLookupPrice(rw.name);
-                                const CurrencyTex* itex = GetItemTexture(pr.iconPath);
-                                if (itex) {
-                                    float h = ImGui::GetTextLineHeight();
-                                    ImGui::Image(itex->id, ImVec2(h, h));
-                                    ImGui::SameLine(0.0f, 4.0f);
-                                }
+                        bool lineStarted = false;
+
+                        // 1) reward item icon (icon path comes from the price DB,
+                        //    so unpriced rewards have none to show)
+                        if (m_RsShowRowIcon && rw.priced) {
+                            auto pr = CachedLookupPrice(rw.name);
+                            const CurrencyTex* itex = GetItemTexture(pr.iconPath);
+                            if (itex) {
+                                float h = ImGui::GetTextLineHeight();
+                                ImGui::Image(itex->id, ImVec2(h, h));
+                                lineStarted = true;
                             }
-                            snprintf(row, sizeof(row), "%s  x%d   %s",
-                                     rw.name.c_str(), rw.count, priceStr.c_str());
-                            ImGui::TextUnformatted(row);
-                        } else {
-                            // No price found — still list the reward, dimmed.
-                            snprintf(row, sizeof(row), "%s  x%d",
-                                     rw.name.c_str(), rw.count);
-                            ImGui::TextDisabled("%s", row);
+                        }
+
+                        // 2) name + quantity — one text item; the TEXT-style price
+                        //    is merged into it so spacing matches the old look.
+                        std::string txt;
+                        if (m_RsShowRowName) txt = rw.name;
+                        if (m_RsShowRowQty) {
+                            if (!txt.empty()) txt += "  ";
+                            txt += "x" + std::to_string(rw.count);
+                        }
+                        std::string priceStr;   // non-empty => image-style price pending
+                        if (m_RsShowRowPrice && rw.priced) {
+                            float displayVal = ChaosToDisplay(rw.totalChaos, divInChaos, exInChaos);
+                            if (rowCTex) {
+                                priceStr = FormatPriceNumberLocal(displayVal);
+                            } else {
+                                if (!txt.empty()) txt += "   ";
+                                txt += FormatPriceLocal(displayVal, m_DisplayCurrency);
+                            }
+                        }
+                        if (!txt.empty()) {
+                            if (lineStarted) ImGui::SameLine(0.0f, 4.0f);
+                            if (rw.priced) ImGui::TextUnformatted(txt.c_str());
+                            else           ImGui::TextDisabled("%s", txt.c_str());   // no price found — dimmed
+                            lineStarted = true;
+                        }
+
+                        // 3) image-style price: number + currency icon (aspect-
+                        //    corrected width, matching the header rendering)
+                        if (!priceStr.empty()) {
+                            if (lineStarted) ImGui::SameLine(0.0f, 12.0f);
+                            ImGui::TextUnformatted(priceStr.c_str());
+                            ImGui::SameLine(0.0f, 4.0f);
+                            const float ih = ImGui::GetTextLineHeight();
+                            const float iw = ih * (rowCTex->h
+                                ? static_cast<float>(rowCTex->w) / static_cast<float>(rowCTex->h) : 1.0f);
+                            ImGui::Image(rowCTex->id, ImVec2(iw, ih));
+                            lineStarted = true;
                         }
 
                         // Total rune weight of THIS combination (host RuneShape tab).
                         if (m_ShowRuneshapeWeights) {
-                            ImGui::SameLine(0.0f, 10.0f);
+                            if (lineStarted) ImGui::SameLine(0.0f, 10.0f);
                             const ImVec4 wc = (rw.comboWeight > 0) ? ImVec4(0.43f, 0.92f, 0.43f, 1.0f)
                                             : (rw.comboWeight < 0) ? ImVec4(1.0f, 0.43f, 0.43f, 1.0f)
                                                                    : ImVec4(0.72f, 0.72f, 0.72f, 1.0f);
@@ -1873,13 +2035,14 @@ private:
                             ImGui::TextColored(wc, "%s", wbuf);
                             if (ImGui::IsItemHovered())
                                 ImGui::SetTooltip("Total rune weight of this combination");
+                            lineStarted = true;
                         }
 
                         // Propagating-rune marker (0.5.4 carryover): the propagating
                         // rune ICON(s) with a thin gold ring (replaces the old gold
                         // dot) + the rune name(s). Purple name = rare ("valuable").
-                        if (rw.propagatingCount > 0 && !rw.propagatingRunes.empty()) {
-                            ImGui::SameLine(0.0f, 10.0f);
+                        if (m_RsShowRowPropRunes && rw.propagatingCount > 0 && !rw.propagatingRunes.empty()) {
+                            if (lineStarted) ImGui::SameLine(0.0f, 10.0f);
                             ImDrawList* rdl = ImGui::GetWindowDrawList();
                             const float  lh  = ImGui::GetTextLineHeight();
                             const ImVec2 cp  = ImGui::GetCursorScreenPos();
@@ -2153,6 +2316,29 @@ private:
             if (j.contains("runeshapeWinCollapsed") && j["runeshapeWinCollapsed"].is_boolean())
                 m_RuneshapeWinCollapsed = j["runeshapeWinCollapsed"].get<bool>();
             if (j.contains("runeshapeCollapsed") && j["runeshapeCollapsed"].is_array()) { m_RuneshapeCollapsed.clear(); for (auto& c : j["runeshapeCollapsed"]) if (c.is_number_unsigned()) m_RuneshapeCollapsed.insert(c.get<uint32_t>()); }
+            if (j.contains("rsWinToggleHotkey") && j["rsWinToggleHotkey"].is_number_integer())
+                m_RuneshapeWinHotkey = j["rsWinToggleHotkey"].get<int>();
+            if (j.contains("rsWinHideOnHover") && j["rsWinHideOnHover"].is_boolean())
+                m_RuneshapeWinHideOnHover = j["rsWinHideOnHover"].get<bool>();
+            if (j.contains("rsWinPriceStyle") && j["rsWinPriceStyle"].is_number_integer())
+                m_RuneshapeWinPriceStyle = static_cast<PriceDisplayStyle>(
+                    std::clamp(j["rsWinPriceStyle"].get<int>(), 0, 1));
+            if (j.contains("rsWinShowColor") && j["rsWinShowColor"].is_boolean())
+                m_RsShowHdrColor = j["rsWinShowColor"].get<bool>();
+            if (j.contains("rsWinShowRunes") && j["rsWinShowRunes"].is_boolean())
+                m_RsShowHdrRunes = j["rsWinShowRunes"].get<bool>();
+            if (j.contains("rsWinShowBestReward") && j["rsWinShowBestReward"].is_boolean())
+                m_RsShowHdrBest = j["rsWinShowBestReward"].get<bool>();
+            if (j.contains("rsWinShowRewardIcon") && j["rsWinShowRewardIcon"].is_boolean())
+                m_RsShowRowIcon = j["rsWinShowRewardIcon"].get<bool>();
+            if (j.contains("rsWinShowRewardText") && j["rsWinShowRewardText"].is_boolean())
+                m_RsShowRowName = j["rsWinShowRewardText"].get<bool>();
+            if (j.contains("rsWinShowRewardQty") && j["rsWinShowRewardQty"].is_boolean())
+                m_RsShowRowQty = j["rsWinShowRewardQty"].get<bool>();
+            if (j.contains("rsWinShowRewardPrice") && j["rsWinShowRewardPrice"].is_boolean())
+                m_RsShowRowPrice = j["rsWinShowRewardPrice"].get<bool>();
+            if (j.contains("rsWinShowPropRunes") && j["rsWinShowPropRunes"].is_boolean())
+                m_RsShowRowPropRunes = j["rsWinShowPropRunes"].get<bool>();
             if (j.contains("hideWhenUnfocused") && j["hideWhenUnfocused"].is_boolean())
                 m_HideWhenUnfocused = j["hideWhenUnfocused"].get<bool>();
             if (j.contains("hideHotkey") && j["hideHotkey"].is_number_integer())
@@ -2284,6 +2470,26 @@ private:
     bool  m_RuneshapeWinCollapsed = false;   // persisted collapse state of the window
     std::unordered_set<uint32_t> m_RuneshapeCollapsed; // persisted per-element collapse (keyed by color)
 
+    // Advanced overlay settings (Overlay Toggles -> "Runeshape window: advanced").
+    int   m_RuneshapeWinHotkey = 0;              // VK toggling the window; 0 = unbound
+    bool  m_RuneshapeWinHotkeyWasDown = false;   // edge-detector state (not persisted)
+    bool  m_RuneshapeWinHideOnHover = false;     // hide while hovered (never while the menu is open)
+    PriceDisplayStyle m_RuneshapeWinPriceStyle = PriceDisplayStyle::Image; // shared: reward rows + header best reward
+    bool  m_RsShowHdrColor  = true;              // header: colored square
+    bool  m_RsShowHdrRunes  = true;              // header: rune-socket strip (+ propagation crowns)
+    bool  m_RsShowHdrBest   = true;              // header: best-reward price
+    bool  m_RsShowRowIcon   = true;              // rows: reward item icon
+    bool  m_RsShowRowName   = true;              // rows: reward name
+    bool  m_RsShowRowQty    = true;              // rows: xN quantity
+    bool  m_RsShowRowPrice  = true;              // rows: price
+    bool  m_RsShowRowPropRunes = true;           // rows: propagating (yellow-glow) runes
+    // Last on-screen window rect for hide-on-hover. Deliberately KEPT while the
+    // window is hover-hidden (it isn't submitted then, so it can't refresh) —
+    // the window stays hidden until the cursor leaves this area (no flicker).
+    ImVec2 m_RuneshapeWinRectMin = ImVec2(0.0f, 0.0f);
+    ImVec2 m_RuneshapeWinRectMax = ImVec2(0.0f, 0.0f);
+    bool   m_RuneshapeWinRectValid = false;
+
     // ---- Runeshape Combinations overlay ----
     // Cached row-list container of the open "Runeshape Combinations" panel
     // (0 = not found). Rediscovered via bounded BFS on cache-miss, throttled.
@@ -2308,8 +2514,9 @@ private:
     };
     std::vector<RuneshapeRow> m_RuneshapeRows;
 
-    // UI state
-    bool m_CapturingHotkey = false;
+    // UI state — hotkey capture. Points at the binding currently being captured
+    // (one capture at a time across all hotkey rows); null when idle.
+    int* m_CaptureTarget = nullptr;
 
     // Currency icon textures (image price style). Lazily loaded from
     // Resources/currency/poe2/{divine,exalted,chaos}.png, indexed by
