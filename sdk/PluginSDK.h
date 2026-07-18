@@ -599,6 +599,13 @@ struct ActiveSkill {
     uintptr_t GrantedEffectStatSetsPerLevelAddr = 0;
     uintptr_t SkillDetailsAddr = 0;
 
+    // Visible-bar placement (host-decoded). SkillSlotIndex = 0-based bar slot, or
+    // -1 when the skill is not a directly-socketed skill on the main bar. For each
+    // slot i, the unique skill with IsOnSkillBar && SkillSlotIndex == i is the
+    // icon drawn there (e.g. to overlay its DPS). 0 if the host predates this field.
+    int  SkillSlotIndex = -1;
+    bool IsOnSkillBar   = false;
+
     struct EquipmentInfo {
         uint32_t  GemNameHash = 0;
         int       InventorySlot = 0;
@@ -625,6 +632,8 @@ struct ActiveSkill {
         s.ActiveSkillsDatAddr              = a.active_skills_dat_addr;
         s.GrantedEffectStatSetsPerLevelAddr = a.granted_effect_stat_sets_per_level_addr;
         s.SkillDetailsAddr                 = a.skill_details_addr;
+        s.SkillSlotIndex                   = a.skill_slot_index;
+        s.IsOnSkillBar                     = a.is_on_skill_bar != 0;
 
         uint32_t packed = a.equipment_info_packed;
         s.Equipment.GemNameHash   = packed >> 0x10;

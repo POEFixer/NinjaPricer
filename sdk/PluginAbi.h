@@ -404,6 +404,17 @@ typedef struct {
     uintptr_t active_skills_dat_addr;
     uintptr_t granted_effect_stat_sets_per_level_addr;
     uintptr_t skill_details_addr;
+    // Skill-bar placement (append 2026-07-09; ActiveSkillAbi is visitor-delivered
+    // via const*, so tail growth is safe for plugins built against the older
+    // layout). skill_slot_index = 0-based position on the visible main skill bar,
+    // or -1 when the skill is not a directly-socketed skill on that bar (a
+    // command/linked sub-skill, support, ascendancy, or movement skill).
+    // is_on_skill_bar = (skill_slot_index != -1). For each bar slot i, the unique
+    // skill with is_on_skill_bar && skill_slot_index == i is the icon drawn there.
+    // Decoded host-side from equipment_info_packed (see
+    // game_client/components/SkillBarDecode.h).
+    int32_t  skill_slot_index;
+    int32_t  is_on_skill_bar;
 } ActiveSkillAbi;
 
 // One active buff/debuff (enumerate_buffs). name_addr is host-owned.
