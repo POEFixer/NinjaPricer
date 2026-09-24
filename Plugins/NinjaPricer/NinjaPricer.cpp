@@ -6,15 +6,15 @@
 // queries ctx()->Prices.
 // ============================================================================
 
-#include "sdk/PluginSDK.h"
-#include <imgui.h>
+#include "../../POEFixer/plugin_sdk/PluginSDK.h"
+#include "../../POEFixer/imgui/imgui.h"
 #include <d3d11.h>
 
 // stb_image for loading currency icon PNGs (image price-display style).
 // Implementation lives in this single plugin TU.
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_ONLY_PNG
-#include <stb_image.h>
+#include "../../POEFixer/imgui/stb_image.h"
 
 #include "lib/nlohmann/json.hpp"
 

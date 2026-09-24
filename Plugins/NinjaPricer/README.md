@@ -1,0 +1,41 @@
+# NinjaPricer — Item Price Overlay Plugin
+
+An item price overlay for POE2Fixer: prices appear directly on dropped items, in your
+inventory and in the open stash tab, plus Ritual shop and Runeshape rewards.
+
+## Where the prices come from
+
+NinjaPricer does no downloading of its own. It shows the prices POE2Fixer already
+loads: the price source (poe.ninja or poe2scout) and the league are chosen in POEFixer
+**Settings -> Prices**, and the plugin follows that choice. The **Data Source** tab shows
+whether prices are loaded, how many items are known and the current Divine / Exalted
+exchange rates.
+
+## What It Does
+
+- **Dropped items** — a price next to each item label on the ground, multiplied by the
+  stack size. The position (top, bottom, left or right of the label) is configurable.
+- **Inventory and stash** — a price in the corner of each occupied cell (corner
+  configurable), with an optional colour square or item icon.
+- **Ritual shop** — prices on the Favours window.
+- **Runeshape** — reward prices for Runeshape devices, rune sockets and propagating runes,
+  and a Runeshape window with the best reward's name, quantity, icon and price (text or
+  currency icon, adjustable opacity, a show/hide hotkey, hides on mouse hover if wanted).
+- **Currency display** — values in Divine (D), Exalted (E) or Chaos (C).
+- **Minimum price per currency** — hide anything worth less than your Divine / Exalted /
+  Chaos threshold (the stack or reward total counts; 0 turns a minimum off). Prices are
+  not drawn on the selected currency itself.
+
+## Settings
+
+- **Display Settings** — currency mode, text size, label positions for ground items and for
+  inventory/stash, minimum prices, inventory scan interval.
+- **Overlay Toggles** — dropped items, inventory, stash, Ritual, Runeshape (and its window
+  options), item icons, colour square, hide when the game is not focused, and a
+  hold-to-hide hotkey (any key or mouse button).
+- **Debug** — diagnostics for troubleshooting.
+
+## Disclaimer
+
+Community third-party plugin for POE2Fixer. Use at your own risk. Not affiliated with
+Grinding Gear Games.

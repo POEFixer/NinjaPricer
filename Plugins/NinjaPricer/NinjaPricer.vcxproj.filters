@@ -1,0 +1,14 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <ClCompile Include="NinjaPricer.cpp" />
+    <ClCompile Include="..\..\POEFixer\imgui\imgui.cpp" />
+    <ClCompile Include="..\..\POEFixer\imgui\imgui_draw.cpp" />
+    <ClCompile Include="..\..\POEFixer\imgui\imgui_tables.cpp" />
+    <ClCompile Include="..\..\POEFixer\imgui\imgui_widgets.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="..\..\POEFixer\plugin_sdk\PluginAbi.h" />
+    <ClInclude Include="..\..\POEFixer\plugin_sdk\PluginSDK.h" />
+  </ItemGroup>
+</Project>

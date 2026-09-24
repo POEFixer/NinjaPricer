@@ -1,74 +1,56 @@
 # NinjaPricer — Item Price Overlay Plugin
 
-A real-time item price overlay for POE2Fixer that fetches prices from **poe2scout** and **poe.ninja**, displaying them directly on ground items, inventory, and stash tabs.
+An item price overlay for POE2Fixer: prices appear directly on dropped items, in your
+inventory and in the open stash tab, plus Ritual shop and Runeshape rewards.
+
+## Where the prices come from
+
+NinjaPricer does no downloading of its own. It shows the prices POE2Fixer already
+loads: the price source (poe.ninja or poe2scout) and the league are chosen in POEFixer
+**Settings -> Prices**, and the plugin follows that choice. The **Data Source** tab shows
+whether prices are loaded, how many items are known and the current Divine / Exalted
+exchange rates.
 
 ## What It Does
 
-NinjaPricer automatically prices items you encounter in Path of Exile 2 by querying online price databases and rendering the prices as an overlay on top of the game.
+- **Dropped items** — a price next to each item label on the ground, multiplied by the
+  stack size. The position (top, bottom, left or right of the label) is configurable.
+- **Inventory and stash** — a price in the corner of each occupied cell (corner
+  configurable), with an optional colour square or item icon.
+- **Ritual shop** — prices on the Favours window.
+- **Runeshape** — reward prices for Runeshape devices, rune sockets and propagating runes,
+  and a Runeshape window with the best reward's name, quantity, icon and price (text or
+  currency icon, adjustable opacity, a show/hide hotkey, hides on mouse hover if wanted).
+- **Currency display** — values in Divine (D), Exalted (E) or Chaos (C).
+- **Minimum price per currency** — hide anything worth less than your Divine / Exalted /
+  Chaos threshold (the stack or reward total counts; 0 turns a minimum off). Prices are
+  not drawn on the selected currency itself.
 
-### Dual Price Sources
-- **poe2scout** (default) — comprehensive PoE 2 coverage with unique item pricing
-- **poe.ninja** — alternative/supplementary data source
+## Settings
 
-You can switch between sources in the plugin settings at any time.
+- **Display Settings** — currency mode, text size, label positions for ground items and for
+  inventory/stash, minimum prices, inventory scan interval.
+- **Overlay Toggles** — dropped items, inventory, stash, Ritual, Runeshape (and its window
+  options), item icons, colour square, hide when the game is not focused, and a
+  hold-to-hide hotkey (any key or mouse button).
+- **Debug** — diagnostics for troubleshooting.
 
-### Price Categories
-Fetches prices across **15 currency categories**: Currency, Fragments, Abyssal Bones, Uncut Gems, Essences, Soul Cores, Idols, Runes, Ritual Omens, Expedition, Delirium, Breach, Lineage Support Gems, Reliquary Keys (poe2scout only), Incursion (poe2scout only).
+## Disclaimer
 
-Additionally supports **7 unique item categories** (poe2scout only): Accessories, Armour, Flasks, Jewels, Maps, Weapons, Sanctum Research.
+Community third-party plugin for POE2Fixer. Use at your own risk. Not affiliated with
+Grinding Gear Games.
 
-Each category can be individually toggled on or off.
+## Build from source
 
-## How It Works
+This repository is the plugin folder from the POEFixer source tree (`Plugins/NinjaPricer/`) together with the host files it compiles against, kept at the same relative paths:
 
-### Three Display Locations
+- `POEFixer/plugin_sdk/` - the POEFixer Plugin SDK v6 headers (`PluginAbi.h`, `PluginSDK.h`)
+- `POEFixer/imgui/` - the Dear ImGui sources the DLL compiles against
 
-**Ground Items** — prices appear on dropped items in the game world. Detects stack counts (e.g., "2x Divine Orb" shows doubled price). Position is configurable: Top, Bottom, Left, or Right of the item label.
-
-**Inventory** — prices appear on items in the player inventory grid. Font size adapts automatically for small cells. Position configurable: any corner of each cell.
-
-**Stash Tabs** — prices appear on items in the currently open stash tab. The plugin auto-detects the stash UI and active tab index.
-
-### Price Display
-- **Three currency modes**: Divine (D), Exalted (E), Chaos (C)
-- **Color-coded values**: gold (>= 1 Divine), white (>= 0.1 Divine), gray (< 0.1 Divine)
-- **Adjustable text size**: 0.5x to 2.0x
-
-### Auto-Refresh
-A background thread fetches prices every 5-60 minutes (configurable interval). A manual refresh button is available. Prices are cached locally as JSON files for offline fallback.
-
-### League Detection
-Automatically fetches the current league list from poe2scout.com API. Fallback leagues: Fate of the Vaal, HC Fate of the Vaal, Standard, Hardcore.
-
-### Visibility Controls
-- **Auto-hide** when the game window is not in focus
-- **Hold-to-hide hotkey** for temporarily hiding the overlay during gameplay
-- **Per-category toggles** to enable/disable individual price categories
-
-### Settings
-League selector, data source selection, currency display mode, text scale, display position per location, refresh interval, category toggles, hide hotkey configuration.
-
-## Build
-
-**Requirements:** Visual Studio 2022 (MSVC v143), Windows SDK 10.0, C++20
-
-Open `NinjaPricer.sln` and build **Release | x64**.
-
-Or from command line:
-```
-"C:\Program Files\Microsoft Visual Studio\2022\Community\MSBuild\Current\Bin\MSBuild.exe" NinjaPricer.sln -p:Configuration=Release -p:Platform=x64
-```
-
-Output: `bin\Release\NinjaPricer.dll`
-
-## Dependencies
-
-All dependencies are bundled — no external installs needed:
-- **nlohmann/json** (`lib/nlohmann/json.hpp`) — JSON parser for API responses
-- **wininet.lib** — Windows SDK HTTP library (linked automatically, no install needed)
-- **ImGui** (`imgui/`) — immediate-mode GUI library
-- **Plugin SDK** (`sdk/`) — POE2Fixer plugin interface headers
+1. Install Visual Studio 2022 with the "Desktop development with C++" workload (MSVC v143, Windows 10/11 SDK).
+2. Open `NinjaPricer.sln`, select **Release | x64** and build the solution.
+3. The plugin is written to `x64\Release\Plugins\NinjaPricer\NinjaPricer.dll`.
 
 ## Install
 
-Copy `NinjaPricer.dll` to `Plugins/NinjaPricer/` in your POE2Fixer directory, then enable it in the Plugins tab.
+Copy `NinjaPricer.dll` into `Plugins\NinjaPricer\` next to the POEFixer executable (create the folder if needed), start POEFixer and enable the plugin in the Plugins tab.

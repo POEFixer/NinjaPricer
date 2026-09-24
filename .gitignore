@@ -1,10 +1,11 @@
-bin/
-obj/
+# Build output (Visual Studio / MSBuild)
+x64/
 Release/
 Debug/
-x64/
-*.user
-*.suo
-*.ncb
-*.sdf
+bin/
+obj/
 .vs/
+*.user
+*.aps
+*.ipch
+*.VC.db
