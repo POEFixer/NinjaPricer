@@ -22,6 +22,7 @@
 #include <fstream>
 #include <filesystem>
 #include <string>
+#include <string_view>
 #include <chrono>
 #include <unordered_map>
 #include <unordered_set>
@@ -32,6 +33,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <limits>
 
 // Host-synthesized inventory ID for the Ritual shop ("Favours" window). The
 // host's ScanInventoryGrid publishes the shop grid under this ID (it is not a
@@ -71,6 +73,11 @@ enum class DisplayCurrency : int {
     Divine  = 0,
     Exalted = 1,
     Chaos   = 2,
+};
+
+static constexpr const char* kMinimumPriceKeys[] = { "divine", "exalted", "chaos" };
+static constexpr const char* kMinimumPriceLabels[] = {
+    "Minimum price (Divine)", "Minimum price (Exalted)", "Minimum price (Chaos)"
 };
 
 // ============================================================================
@@ -172,9 +179,53 @@ static float GetDisplayValue(const PluginSDK::PriceResult& r, DisplayCurrency c)
     }
 }
 
+namespace NinjaPricerHotkeys {
+
+using KeyState = std::array<bool, 256>;
+
+// Capture starts from a mouse click on the settings button.  Remember every key that is
+// already down so that the activation click (including a right-click on an overlay host)
+// cannot become the newly assigned hotkey.  It becomes eligible after it is released and
+// pressed again.
+inline void Arm(KeyState& ignoredDown, const KeyState& down) {
+    ignoredDown = down;
+}
+
+inline int Capture(const KeyState& down, KeyState& ignoredDown) {
+    for (size_t i = 0; i < ignoredDown.size(); ++i) {
+        if (ignoredDown[i] && !down[i]) ignoredDown[i] = false;
+    }
+
+    auto pressed = [&](int vk) {
+        return vk >= 0 && vk < static_cast<int>(down.size()) &&
+               down[static_cast<size_t>(vk)] && !ignoredDown[static_cast<size_t>(vk)];
+    };
+    if (pressed(VK_ESCAPE)) return VK_ESCAPE;
+
+    // Mouse buttons are valid virtual-key hotkeys too.  They are checked explicitly
+    // because the ordinary keyboard scan starts at VK_BACK (0x08).
+    for (const int vk : { VK_LBUTTON, VK_RBUTTON, VK_MBUTTON, VK_XBUTTON1, VK_XBUTTON2 }) {
+        if (pressed(vk)) return vk;
+    }
+    for (int vk = 0x08; vk < 0xFF; ++vk) {
+        if (pressed(vk)) return vk;
+    }
+    return 0;
+}
+
+} // namespace NinjaPricerHotkeys
+
 // Virtual key name helper
 static const char* GetVkName(int vk) {
     if (vk == 0) return "None";
+    switch (vk) {
+    case VK_LBUTTON: return "LMouse";
+    case VK_RBUTTON: return "RMouse";
+    case VK_MBUTTON: return "MMouse";
+    case VK_XBUTTON1: return "Mouse4";
+    case VK_XBUTTON2: return "Mouse5";
+    default: break;
+    }
     static char buf[64];
     UINT scanCode = MapVirtualKeyA(vk, MAPVK_VK_TO_VSC);
     char keyName[32] = {};
@@ -202,6 +253,7 @@ public:
         if (ctx()->ImGuiContext)
             ImGui::SetCurrentContext(static_cast<ImGuiContext*>(ctx()->ImGuiContext));
         LoadSettings();
+        InvalidateDisplayCaches();
         ctx()->Log.Info("[NinjaPricer] Plugin enabled");
     }
 
@@ -261,6 +313,11 @@ public:
             ImGui::Text("Rates: 1 Divine = %.1f Chaos | 1 Exalted = %.1f Chaos",
                 st.divineInChaos, st.exaltedInChaos);
         }
+        // Disabled colour + wrapping: TextDisabled never wraps and this line is wider than
+        // the settings window at its default width.
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
+        ImGui::TextWrapped("Price source and league are chosen in Settings -> Prices (host); this plugin follows that choice.");
+        ImGui::PopStyleColor();
     }
 
     void DrawTabDisplaySettings() {
@@ -268,10 +325,23 @@ public:
 
         ImGui::Text("Value Display:");
         int dc = static_cast<int>(m_DisplayCurrency);
-        ImGui::RadioButton("Divine (D)", &dc, 0); ImGui::SameLine();
-        ImGui::RadioButton("Exalted (E)", &dc, 1); ImGui::SameLine();
-        ImGui::RadioButton("Chaos (C)", &dc, 2);
+        bool displayChanged = ImGui::RadioButton("Divine (D)", &dc, 0); ImGui::SameLine();
+        displayChanged |= ImGui::RadioButton("Exalted (E)", &dc, 1); ImGui::SameLine();
+        displayChanged |= ImGui::RadioButton("Chaos (C)", &dc, 2);
         m_DisplayCurrency = static_cast<DisplayCurrency>(dc);
+
+        ImGui::Spacing();
+        for (size_t i = 0; i < m_MinimumPrices.size(); ++i) {
+            ImGui::SetNextItemWidth(160.0f);
+            if (ImGui::InputFloat(kMinimumPriceLabels[i], &m_MinimumPrices[i], 0.0f, 0.0f, "%.3f")) {
+                if (!std::isfinite(m_MinimumPrices[i]) || m_MinimumPrices[i] < 0.0f)
+                    m_MinimumPrices[i] = 0.0f;
+                displayChanged = true;
+            }
+        }
+        ImGui::TextWrapped("Each currency keeps its own minimum. Prices use the total stack or reward value; 0 disables the minimum.");
+        ImGui::TextWrapped("Price labels are hidden on the selected currency itself.");
+        if (displayChanged) InvalidateDisplayCaches();
 
         ImGui::Spacing();
         ImGui::Text("Price style:");
@@ -318,6 +388,14 @@ public:
     // ESC cancels. One capture at a time across all rows by construction.
     // Returns true when a key was bound THIS frame — the key is physically down
     // at that moment, so callers can re-arm edge detectors against it.
+    void BeginHotkeyCapture(int* target) {
+        NinjaPricerHotkeys::KeyState down{};
+        for (int vk = 0; vk < static_cast<int>(down.size()); ++vk)
+            down[static_cast<size_t>(vk)] = (GetAsyncKeyState(vk) & 0x8000) != 0;
+        NinjaPricerHotkeys::Arm(m_CaptureIgnoredDown, down);
+        m_CaptureTarget = target;
+    }
+
     bool DrawHotkeyCaptureRow(const char* label, const char* idSuffix, int& vk) {
         bool boundNow = false;
         ImGui::Text("%s", label);
@@ -325,20 +403,18 @@ public:
         if (m_CaptureTarget == &vk) {
             ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, 1.0f),
                 "Press any key... (ESC to cancel)");
-            if (GetAsyncKeyState(VK_ESCAPE) & 0x8000) {
+            NinjaPricerHotkeys::KeyState down{};
+            for (int key = 0; key < static_cast<int>(down.size()); ++key)
+                down[static_cast<size_t>(key)] = (GetAsyncKeyState(key) & 0x8000) != 0;
+            const int captured = NinjaPricerHotkeys::Capture(down, m_CaptureIgnoredDown);
+            if (captured == VK_ESCAPE) {
                 m_CaptureTarget = nullptr;
-            }
-            else {
-                for (int k = 0x08; k < 0xFF; k++) {
-                    if (k == VK_LBUTTON || k == VK_RBUTTON || k == VK_MBUTTON) continue;
-                    if (k == VK_ESCAPE) continue;
-                    if (GetAsyncKeyState(k) & 0x8000) {
-                        vk = k;
-                        m_CaptureTarget = nullptr;
-                        boundNow = true;
-                        break;
-                    }
-                }
+                m_CaptureIgnoredDown.fill(false);
+            } else if (captured != 0) {
+                vk = captured;
+                m_CaptureTarget = nullptr;
+                m_CaptureIgnoredDown.fill(false);
+                boundNow = true;
             }
         }
         else {
@@ -347,7 +423,7 @@ public:
             char btn[48];
             snprintf(btn, sizeof(btn), "Set Hotkey##%s", idSuffix);
             if (ImGui::Button(btn, ImVec2(100.0f, 0.0f)))
-                m_CaptureTarget = &vk;
+                BeginHotkeyCapture(&vk);
             if (vk != 0) {
                 ImGui::SameLine();
                 snprintf(btn, sizeof(btn), "Clear##%s", idSuffix);
@@ -498,9 +574,22 @@ public:
             m_LastAreaChange = areaChange;
         }
 
+        // Selection can make prices unavailable before the next snapshot arrives. Drop
+        // every retained price on that revision too, before the loaded gate below.
+        const uint64_t priceRevision = ctx()->Prices.GetRevision();
+        if (priceRevision != 0 && priceRevision != m_PriceRevisionSeen) {
+            InvalidateDisplayCaches();
+            m_PriceRevisionSeen = priceRevision;
+        }
+
         // Gate on the host price service being ready.
         auto st = ctx()->Prices.GetStatus();
-        if (!st.loaded) return;
+        if (!st.loaded) {
+            // The Runeshape window is not submitted below; release only this plugin's
+            // previous input request while a selection change or failed load hides it.
+            ctx()->Overlay.SetWantsOverlayInput(false);
+            return;
+        }
 
         m_CachedDivineInChaos  = st.divineInChaos;
         if (st.exaltedInChaos > 0.0f) m_CachedExaltedInChaos = st.exaltedInChaos;
@@ -513,8 +602,7 @@ public:
             if (st.divineInChaos  != m_PriceCacheDivineSeen ||
                 st.exaltedInChaos != m_PriceCacheExaltedSeen ||
                 nowPC - m_LastPriceCacheFlush > std::chrono::seconds(30)) {
-                m_PriceCache.clear();
-                m_GroundResolveCache.clear();   // cached resolves hold PriceResults — refresh with prices
+                InvalidateDisplayCaches();
                 m_PriceCacheDivineSeen  = st.divineInChaos;
                 m_PriceCacheExaltedSeen = st.exaltedInChaos;
                 m_LastPriceCacheFlush   = nowPC;
@@ -625,6 +713,8 @@ public:
         try {
             nlohmann::json j;
             j["displayCurrency"] = static_cast<int>(m_DisplayCurrency);
+            for (size_t i = 0; i < m_MinimumPrices.size(); ++i)
+                j["minimumPrices"][kMinimumPriceKeys[i]] = m_MinimumPrices[i];
             j["textScale"] = m_TextScale;
             j["showGroundPrices"] = m_ShowGroundPrices;
             j["showInventoryPrices"] = m_ShowInventoryPrices;
@@ -665,6 +755,33 @@ public:
     }
 
 private:
+    // All price surfaces share the same rule, after multiplying by stack/reward
+    // quantity. Compare the exact item name: Greater Exalted Orb is not Exalted Orb.
+    bool ShouldShowPrice(std::string_view name, float total) const {
+        static constexpr std::string_view currencyNames[] = {
+            "divine orb", "exalted orb", "chaos orb"
+        };
+        const int currency = static_cast<int>(m_DisplayCurrency);
+        if (currency < 0 || currency >= static_cast<int>(m_MinimumPrices.size())) return false;
+        const auto ownCurrency = currencyNames[currency];
+        if (name.size() == ownCurrency.size() &&
+            std::equal(name.begin(), name.end(), ownCurrency.begin(), [](char a, char b) {
+                return std::tolower(static_cast<unsigned char>(a)) == b;
+            })) return false;
+        return std::isfinite(total) && total >= 0.001f && total >= m_MinimumPrices[currency];
+    }
+
+    void InvalidateDisplayCaches() {
+        // Resolved items and display tags retain prices independently. Invalidate all of
+        // them together so a new snapshot or selection is visible on the next frame.
+        m_PriceCache.clear();
+        m_GroundResolveCache.clear();
+        m_GroundTags.clear();
+        m_RuneshapeRows.clear();
+        m_LastGroundScan = {};
+        m_LastRuneshapeScan = {};
+    }
+
     // ========================================================================
     // Debug Panel
     // ========================================================================
@@ -893,6 +1010,7 @@ private:
                         }
                         if (ok) {
                             r.priceable = true;
+                            r.name = name;
                             r.price = price;
                             r.stackMultiplier = 1;
                             if (inner && inner->Components.HasStack()) {
@@ -901,6 +1019,10 @@ private:
                             }
                         }
                     }
+                } else {
+                    // The item name may still be streaming in. Retry next scan
+                    // instead of caching it as unpriceable until the DB refresh.
+                    continue;
                 }
                 cit = m_GroundResolveCache.emplace(e.Address, std::move(r)).first;
             }
@@ -913,7 +1035,7 @@ private:
             // PriceResult each scan so a currency/icon toggle applies without an
             // RPM re-read.
             float displayValue = GetDisplayValue(gr.price, m_DisplayCurrency) * gr.stackMultiplier;
-            if (displayValue < 0.001f) continue;
+            if (!ShouldShowPrice(gr.name, displayValue)) continue;
 
             GroundTag t;
             t.wx = gr.wx; t.wy = gr.wy; t.wz = gr.wz;
@@ -1001,7 +1123,7 @@ private:
 
             int multiplier = (item.StackCount > 1) ? item.StackCount : 1;
             float displayValue = GetDisplayValue(price, m_DisplayCurrency) * multiplier;
-            if (displayValue < 0.001f) continue;
+            if (!ShouldShowPrice(displayName, displayValue)) continue;
 
             // Special stash tabs (currency/fragments/expedition/...) arrange their
             // cells freely, not on a uniform grid — the host resolves each item's
@@ -1490,14 +1612,9 @@ private:
         }
         if (outName.empty()) return false;
 
-        // Generic unique-class rewards ("Unique Ring", "Unique Belt", "Unique
-        // Amulet", "Unique Body Armour", ...) describe a RANDOM unique of that slot
-        // — there is no single tradeable item, so they have no meaningful price.
-        // Left unfiltered they slip past the exact lookup and land on LookupPrice's
-        // contains-match onto an unrelated unique whose name is a substring (e.g.
-        // "Unique Ring" -> a ~23 div unique), painting a bogus price on the panel.
-        // No real reward item name begins with the rarity word "Unique ".
-        if (outName.rfind("Unique ", 0) == 0) return false;
+        // Keep generic unique-class rewards in the lookup path. The central price
+        // matcher rejects automatic aliases for unspecified categories, while an
+        // explicit custom price remains a valid user override.
 
         return true;
     }
@@ -1788,6 +1905,9 @@ private:
                 float priceW = 0.0f;
                 if (bestPriced) {
                     bestDisplay = ChaosToDisplay(rewards[r.bestIndex].totalChaos, divInChaos, exInChaos);
+                    bestPriced = ShouldShowPrice(rewards[r.bestIndex].name, bestDisplay);
+                }
+                if (bestPriced) {
                     // Shared price style: icon+number, or plain text ("2.5 D").
                     // Text is also the fallback when the icon texture is missing.
                     ctex = (m_RuneshapeWinPriceStyle == PriceDisplayStyle::Image)
@@ -1999,8 +2119,8 @@ private:
                             txt += "x" + std::to_string(rw.count);
                         }
                         std::string priceStr;   // non-empty => image-style price pending
-                        if (m_RsShowRowPrice && rw.priced) {
-                            float displayVal = ChaosToDisplay(rw.totalChaos, divInChaos, exInChaos);
+                        const float displayVal = ChaosToDisplay(rw.totalChaos, divInChaos, exInChaos);
+                        if (m_RsShowRowPrice && rw.priced && ShouldShowPrice(rw.name, displayVal)) {
                             if (rowCTex) {
                                 priceStr = FormatPriceNumberLocal(displayVal);
                             } else {
@@ -2157,7 +2277,7 @@ private:
                 PluginSDK::PriceResult price = CachedLookupPrice(name);
                 if (price.found) {
                     float total = GetDisplayValue(price, m_DisplayCurrency) * qty;
-                    if (total >= 0.001f) {
+                    if (ShouldShowPrice(name, total)) {
                         rr.total = total;
                         rr.chaos = price.chaos * qty;
                         rr.iconPath = price.iconPath;
@@ -2290,9 +2410,23 @@ private:
             if (!f.is_open()) return;
             nlohmann::json j = nlohmann::json::parse(f);
 
-            if (j.contains("displayCurrency") && j["displayCurrency"].is_number_integer())
-                m_DisplayCurrency =
-                    static_cast<DisplayCurrency>(j["displayCurrency"].get<int>());
+            if (j.contains("displayCurrency") && j["displayCurrency"].is_number_integer()) {
+                const double currency = j["displayCurrency"].get<double>();
+                m_DisplayCurrency = (currency >= 0.0 && currency <= 2.0)
+                    ? static_cast<DisplayCurrency>(static_cast<int>(currency)) : DisplayCurrency::Divine;
+            }
+            m_MinimumPrices.fill(0.0f);
+            if (j.contains("minimumPrices") && j["minimumPrices"].is_object()) {
+                const auto& minimums = j["minimumPrices"];
+                for (size_t i = 0; i < m_MinimumPrices.size(); ++i) {
+                    const auto value = minimums.find(kMinimumPriceKeys[i]);
+                    if (value == minimums.end() || !value->is_number()) continue;
+                    const double minimum = value->get<double>();
+                    if (std::isfinite(minimum) && minimum >= 0.0 &&
+                        minimum <= (std::numeric_limits<float>::max)())
+                        m_MinimumPrices[i] = static_cast<float>(minimum);
+                }
+            }
             if (j.contains("textScale") && j["textScale"].is_number())
                 m_TextScale = j["textScale"].get<float>();
             if (j.contains("showGroundPrices") && j["showGroundPrices"].is_boolean())
@@ -2371,6 +2505,7 @@ private:
     // ========================================================================
 
     DisplayCurrency m_DisplayCurrency = DisplayCurrency::Divine;
+    std::array<float, 3> m_MinimumPrices{};
     PriceDisplayStyle m_PriceDisplayStyle = PriceDisplayStyle::Image;  // default: icon
     float m_TextScale = 1.0f;
     bool m_ShowGroundPrices = true;
@@ -2408,6 +2543,7 @@ private:
     struct GroundResolve {
         bool priceable = false;
         float wx = 0, wy = 0, wz = 0;
+        std::string name;
         PluginSDK::PriceResult price{};
         int stackMultiplier = 1;
         uint32_t epoch = 0;
@@ -2430,8 +2566,10 @@ private:
     // stash tab sustains DrawUI > 50 ms and the host perf-watchdog disables the
     // plugin. Memoizing by display name collapses the per-frame cost to O(items)
     // hash lookups. Cleared on area change and when the host DB refreshes (rate
-    // shift) or on a 30 s safety interval. See CachedLookupPrice / TimedLookup.
+    // shift or revision) or on a 30 s safety interval for older hosts.
+    // See CachedLookupPrice / TimedLookup.
     std::unordered_map<std::string, PluginSDK::PriceResult> m_PriceCache;
+    uint64_t m_PriceRevisionSeen = 0;
     float m_PriceCacheDivineSeen  = 0.0f;
     float m_PriceCacheExaltedSeen = 0.0f;
     std::chrono::steady_clock::time_point m_LastPriceCacheFlush;
@@ -2522,6 +2660,7 @@ private:
     // UI state — hotkey capture. Points at the binding currently being captured
     // (one capture at a time across all hotkey rows); null when idle.
     int* m_CaptureTarget = nullptr;
+    NinjaPricerHotkeys::KeyState m_CaptureIgnoredDown{};
 
     // Currency icon textures (image price style). Lazily loaded from
     // Resources/currency/poe2/{divine,exalted,chaos}.png, indexed by
