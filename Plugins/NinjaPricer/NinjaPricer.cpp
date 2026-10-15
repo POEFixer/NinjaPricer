@@ -41,6 +41,22 @@
 // kRitualShopInventoryId.
 static constexpr int kRitualShopInventoryId = 10001;
 
+// Equipped player and mercenary gear and the flask belt. A full Scan(-1) never
+// reads their items, yet the flask belt sits on the HUD, so its grid is valid all
+// the time. Keep in sync with IsPricingSkippedInventory in
+// POEFixer/game_client/GameClient_Inventory.cpp.
+static bool IsEquippedInventoryId(int inventoryId) {
+    switch (inventoryId) {
+        case 2:  case 3:  case 4:  case 5:  case 6:  case 7:  case 8:   // body/weapon/offhand/helm/amulet/rings
+        case 9:  case 10: case 11: case 12: case 15: case 16:           // gloves/boots/belt/flask/weapon2/offhand2
+        case 80: case 81: case 102:                                     // weapon3/offhand3/ring3
+        case 84: case 85: case 86: case 87: case 88: case 89:           // mercenary equipped
+            return true;
+        default:
+            return false;
+    }
+}
+
 // Price text position for UI items (inventory/stash)
 enum class UiPricePosition : int {
     TopLeft = 0,
@@ -638,9 +654,19 @@ public:
             // read never runs, and the overlay shows nothing (the 50 ms bug).
             int readDelayMs = (std::min)(kInvReadDelayMs, m_PerfScanIntervalMs / 2);
 
+            // A full scan costs the host worker several ms. While no read has shown a
+            // grid DrawInventoryOverlays draws (IsDrawnInventory: no priced panel open)
+            // for kInvGridLatchMs, one request every kInvIdleScanIntervalMs is enough to
+            // notice a panel opening. The latch rides over a read whose kept entries
+            // another plugin's targeted scan republished without geometry.
+            const bool gridRecentlyValid =
+                now - m_LastValidGridRead < std::chrono::milliseconds(kInvGridLatchMs);
+            const int scanIntervalMs = gridRecentlyValid
+                ? m_PerfScanIntervalMs : (std::max)(m_PerfScanIntervalMs, kInvIdleScanIntervalMs);
+
             // 1) Fire an async scan request on the interval. Scan() only flags the
             //    host worker (~0 ms); the worker fills the snapshot within ~1 cycle.
-            if (now - m_LastInventoryScan > std::chrono::milliseconds(m_PerfScanIntervalMs)) {
+            if (now - m_LastInventoryScan > std::chrono::milliseconds(scanIntervalMs)) {
                 double ts0 = PerfNowMs();
                 ctx()->Inventory.Scan(-1);
                 m_PerfScanCallMs = PerfNowMs() - ts0;
@@ -664,7 +690,10 @@ public:
                 m_RarityCache.clear();
                 m_PerfCachedInvCount = static_cast<int>(m_CachedInventories.size());
                 int items = 0;
-                for (const auto& iv : m_CachedInventories) items += static_cast<int>(iv.Items.size());
+                for (const auto& iv : m_CachedInventories) {
+                    items += static_cast<int>(iv.Items.size());
+                    if (IsDrawnInventory(iv)) m_LastValidGridRead = now;
+                }
                 m_PerfCachedItemCount = items;
                 m_InvReadPending = false;
             }
@@ -799,7 +828,7 @@ private:
         ImGui::SetNextItemWidth(220.0f);
         ImGui::SliderInt("Inventory scan interval (ms)", &m_PerfScanIntervalMs, 50, 2000);
         ImGui::SameLine();
-        ImGui::TextDisabled("(default 100; read is decoupled, so this stays cheap)");
+        ImGui::TextDisabled("(default 100; at least 250 while no priced panel is open)");
 
         auto row = [](const char* label, double last, double peak, double warn, double bad) {
             ImVec4 c = (peak > bad) ? ImVec4(1.0f, 0.35f, 0.35f, 1.0f)
@@ -1090,9 +1119,20 @@ private:
     // Inventory / Stash Overlays — Grid.Valid-gated. Iterates every inventory
     // returned by InventoryService.GetAll() and draws prices on each one whose
     // host-populated Grid is valid (host sets Grid.Valid only when the panel
-    // UI is open). No UI-tree identification — robust against locale, panel
-    // reorganization, and StringId changes.
+    // UI is open), except equipped gear and the flask belt. No UI-tree
+    // identification — robust against locale, panel reorganization, and
+    // StringId changes.
     // ========================================================================
+
+    // Whether DrawInventoryOverlays prices this inventory under the current
+    // settings. DrawUI's scan cadence latch asks the same question, so a grid the
+    // overlay never draws (the flask belt on the HUD) cannot hold the fast cadence.
+    bool IsDrawnInventory(const PluginSDK::Inventory& inv) const {
+        if (!inv.Grid.Valid || inv.Grid.CellSize < 1.0f) return false;
+        if (inv.InventoryId == kRitualShopInventoryId) return m_ShowRitualPrices;
+        if (inv.InventoryId == 1) return m_ShowInventoryPrices;
+        return m_ShowOtherInventoryPrices && !IsEquippedInventoryId(inv.InventoryId);
+    }
 
     void DrawInventoryGrid(const PluginSDK::Inventory& inv) {
         ImDrawList* dl = OverlayDrawList();
@@ -1158,19 +1198,7 @@ private:
         // Iterates the cached inventory vector (refreshed by DrawUI once per
         // Scan tick) rather than calling GetAll() per frame.
         for (const auto& inv : m_CachedInventories) {
-            if (!inv.Grid.Valid || inv.Grid.CellSize < 1.0f) continue;
-
-            const bool isPlayer = (inv.InventoryId == 1);
-            const bool isRitual = (inv.InventoryId == kRitualShopInventoryId);
-            if (isRitual) {
-                if (!m_ShowRitualPrices) continue;
-            } else if (isPlayer) {
-                if (!m_ShowInventoryPrices) continue;
-            } else {
-                if (!m_ShowOtherInventoryPrices) continue;
-            }
-
-            DrawInventoryGrid(inv);
+            if (IsDrawnInventory(inv)) DrawInventoryGrid(inv);
         }
     }
 
@@ -1208,17 +1236,21 @@ private:
         auto* device = static_cast<ID3D11Device*>(ctx()->D3DDevice);
         if (!device) return;
 
-        // Index matches DisplayCurrency: Divine=0, Exalted=1, Chaos=2.
-        static const wchar_t* kFiles[3] = { L"divine.png", L"exalted.png", L"chaos.png" };
+        // Index matches DisplayCurrency: Divine=0, Exalted=1, Chaos=2. The host names its
+        // icons by display name since desktop 356; an older host's code-named file is the
+        // fallback (an install keeps both after an update).
+        static const wchar_t* kFiles[3]    = { L"Divine Orb.png", L"Exalted Orb.png", L"Chaos Orb.png" };
+        static const wchar_t* kOldFiles[3] = { L"divine.png", L"exalted.png", L"chaos.png" };
 
         // Resources sit next to the host executable. Absolute + wide path so a
         // non-ASCII install directory (Russian/Chinese/...) still resolves.
         wchar_t exePath[MAX_PATH] = {};
         if (GetModuleFileNameW(nullptr, exePath, MAX_PATH) == 0) return;
-        std::filesystem::path p = std::filesystem::path(exePath).parent_path()
-            / L"Resources" / L"currency" / L"poe2" / kFiles[idx];
+        const std::filesystem::path folder = std::filesystem::path(exePath).parent_path()
+            / L"Resources" / L"currency" / L"poe2";
 
-        std::ifstream f(p, std::ios::binary);
+        std::ifstream f(folder / kFiles[idx], std::ios::binary);
+        if (!f.is_open()) f.open(folder / kOldFiles[idx], std::ios::binary);
         if (!f.is_open()) return;
         std::vector<unsigned char> bytes(
             (std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
@@ -1719,8 +1751,8 @@ private:
     // panel (the list whose rows carry rune symbols — not the flat reward pools).
     // Returns 0 when the panel isn't present. Once cached, the address is
     // revalidated cheaply on every call (no BFS); the expensive BFS rediscovery is
-    // backed off to ~3 s so a closed panel (the common case) costs little — the
-    // trade-off is up to ~3 s before prices appear after opening the panel.
+    // backed off to 800 ms while the host lists a Runeshape device in the area,
+    // and to 5 s otherwise, so a closed panel (the common case) costs little.
     uintptr_t FindRuneshapeRowList() {
         // Fast path: cached list still hosts at least one reward row?
         if (m_RuneshapeListAddr) {
@@ -1736,8 +1768,14 @@ private:
         // BFS while no list is cached — i.e. before the first open in an area, or
         // briefly after the game tears the subtree down. 800 ms keeps first-open
         // latency low while the visibleOnly BFS stays cheap when the panel is shut.
+        // The panel belongs to a monolith: with no Runeshape device resolved in the
+        // area (most maps) the search runs only every 5 s, a fallback in case the
+        // host resolver stops finding devices after a game patch.
         auto now = std::chrono::steady_clock::now();
-        if (now - m_LastRuneshapeDiscover < std::chrono::milliseconds(800)) return 0;
+        const auto sinceDiscover = now - m_LastRuneshapeDiscover;
+        if (sinceDiscover < std::chrono::milliseconds(800)) return 0;
+        if (sinceDiscover < std::chrono::milliseconds(5000) &&
+            ctx()->Runeshape.Runeshapes().empty()) return 0;
         m_LastRuneshapeDiscover = now;
 
         // True UI root = parent of the HUD root that GetUiRoot() returns.
@@ -2345,10 +2383,9 @@ private:
         ImDrawList* dl = OverlayDrawList();
         float baseFontSize = ImGui::GetFontSize() * m_TextScale;
 
-        // Weight chips follow the HOST Radar->RuneShape "Show weights" toggle
-        // (one switch controls the map badge and these chips) AND the plugin's
-        // own checkbox.
-        const bool weightsShown = m_ShowRuneshapeWeights && ctx()->Game.RuneshapeWeightsShown();
+        // Both plugin surfaces use the plugin's checkbox. The host's
+        // "Show weights on map" setting only governs radar badges.
+        const bool weightsShown = m_ShowRuneshapeWeights;
 
         for (const auto& r : m_RuneshapeRows) {
             if (!ctx()->Ui.IsVisible(r.rowAddr)) continue;
@@ -2588,8 +2625,12 @@ private:
     // modest default already feels instant. kInvReadDelayMs is how long after the
     // async Scan() request we pick up the worker's result (≈ one 60 FPS cycle).
     static constexpr int kInvReadDelayMs = 60;
+    // Scan cadence floor while no read has shown a drawn grid for kInvGridLatchMs.
+    static constexpr int kInvIdleScanIntervalMs = 250;
+    static constexpr int kInvGridLatchMs = 1000;
     int    m_PerfScanIntervalMs = 100;    // was hardcoded 1000 ms (caused 1-3 s lag)
     bool   m_InvReadPending = false;      // a Scan() was requested; result not yet read
+    std::chrono::steady_clock::time_point m_LastValidGridRead;   // last read with a grid IsDrawnInventory accepts
     double m_PerfScanCallMs = 0.0;
     double m_PerfGetAllMs = 0.0;
     double m_PerfDrawInvMs = 0.0;
@@ -2663,7 +2704,8 @@ private:
     NinjaPricerHotkeys::KeyState m_CaptureIgnoredDown{};
 
     // Currency icon textures (image price style). Lazily loaded from
-    // Resources/currency/poe2/{divine,exalted,chaos}.png, indexed by
+    // Resources/currency/poe2/{Divine,Exalted,Chaos} Orb.png (an older host's
+    // {divine,exalted,chaos}.png as the fallback), indexed by
     // DisplayCurrency; released on disable/destroy. CurrencyTex is declared in
     // the Drawing Helpers section above.
     CurrencyTex m_CurrencyTex[3];
