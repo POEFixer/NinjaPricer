@@ -2728,6 +2728,6 @@ extern "C" PLUGIN_API void DestroyPlugin(PluginSDK::Plugin* plugin) {
 POEFIXER_PLUGIN_INFO(
     "NinjaPricer",
     "Ninja Pricer",
-    "1.0.0",
+    "1.0.1",
     "POEFixer",
     "Shows item prices on dropped items, in your inventory and stash, in the Ritual shop and on Runeshape rewards.")
