@@ -2082,7 +2082,7 @@ private:
                                                  ImVec2(cx2 + gw * 0.5f, gt + slotSz * 1.76f));
                                 } else if (bg && bg->valid) {
                                     dl->AddCircle(ImVec2(xl + slotSz * 0.5f, midY),
-                                                  slotSz * 0.52f, IM_COL32(255,210,60,255), 0, 1.5f);
+                                                  slotSz * 0.52f, IM_COL32(255,210,60,255), 0, 1.5f, ImDrawFlags_StrokeCenter);
                                 }
                             }
                             xl += slotSz + ((slot + 1 < r.holeCount) ? slotGap : 0.0f);
@@ -2223,7 +2223,7 @@ private:
                                 if (!t || !t->valid) continue;
                                 rdl->AddImage(t->id, ImVec2(px, cp.y), ImVec2(px + lh, cp.y + lh));
                                 rdl->AddCircle(ImVec2(px + lh * 0.5f, cp.y + lh * 0.5f),
-                                               lh * 0.55f, IM_COL32(255, 210, 60, 220), 0, 1.2f);
+                                               lh * 0.55f, IM_COL32(255, 210, 60, 220), 0, 1.2f, ImDrawFlags_StrokeCenter);
                                 px += lh + 4.0f;
                                 ++drawn;
                             }
@@ -2723,3 +2723,11 @@ extern "C" PLUGIN_API PluginSDK::Plugin* CreatePlugin() {
 extern "C" PLUGIN_API void DestroyPlugin(PluginSDK::Plugin* plugin) {
     delete plugin;
 }
+
+// Plugin info: the host checks it before CreatePlugin; the publish tool reads it.
+POEFIXER_PLUGIN_INFO(
+    "NinjaPricer",
+    "Ninja Pricer",
+    "1.0.0",
+    "POEFixer",
+    "Shows item prices on dropped items, in your inventory and stash, in the Ritual shop and on Runeshape rewards.")

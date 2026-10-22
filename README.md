@@ -1,5 +1,9 @@
 # NinjaPricer — Item Price Overlay Plugin
 
+Current version: 1.0.0
+
+Requires POE2Fixer 364 or newer.
+
 An item price overlay for POE2Fixer: prices appear directly on dropped items, in your
 inventory and in the open stash tab, plus Ritual shop and Runeshape rewards.
 
@@ -43,17 +47,18 @@ exchange rates.
 Community third-party plugin for POE2Fixer. Use at your own risk. Not affiliated with
 Grinding Gear Games.
 
+## Install
+
+Install it from POE2Fixer → Plugins → Plugin Manager (one click, updates included), or download `NinjaPricer.zip` from [Releases](https://github.com/POEFixer/NinjaPricer/releases/latest) and extract it into the POE2Fixer folder (it creates `Plugins\NinjaPricer\`). Then enable the plugin in the Plugins tab.
+
 ## Build from source
 
-This repository is the plugin folder from the POEFixer source tree (`Plugins/NinjaPricer/`) together with the host files it compiles against, kept at the same relative paths:
+This repository is the plugin folder from the POE2Fixer source tree (`Plugins/NinjaPricer/`) together with the host files it compiles against, kept at the same relative paths:
 
-- `POEFixer/plugin_sdk/` - the POEFixer Plugin SDK v6 headers (`PluginAbi.h`, `PluginSDK.h`)
+- `POEFixer/plugin_sdk/` - the POE2Fixer Plugin SDK v6 headers (`PluginAbi.h`, `PluginSDK.h`)
 - `POEFixer/imgui/` - the Dear ImGui sources the DLL compiles against
 
 1. Install Visual Studio 2022 with the "Desktop development with C++" workload (MSVC v143, Windows 10/11 SDK).
 2. Open `NinjaPricer.sln`, select **Release | x64** and build the solution.
-3. The plugin is written to `x64\Release\Plugins\NinjaPricer\NinjaPricer.dll`.
-
-## Install
-
-Copy `NinjaPricer.dll` into `Plugins\NinjaPricer\` next to the POEFixer executable (create the folder if needed), start POEFixer and enable the plugin in the Plugins tab.
+3. The plugin is written to `x64\Release\Plugins\NinjaPricer\NinjaPricer.dll` (Release builds carry no debug information, see `Directory.Build.targets`).
+4. Copy `NinjaPricer.dll` into `Plugins\NinjaPricer\` next to the POE2Fixer executable.
