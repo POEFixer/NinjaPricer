@@ -7,6 +7,7 @@
 // ============================================================================
 
 #include "../../POEFixer/plugin_sdk/PluginSDK.h"
+#include "../../POEFixer/plugin_sdk/PluginInfoWindow.h"
 #include "../../POEFixer/imgui/imgui.h"
 #include <d3d11.h>
 
@@ -489,7 +490,8 @@ public:
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("The overlay disappears while the mouse cursor is over it and\n"
                                   "reappears when the cursor leaves. Not applied while the\n"
-                                  "Fixer menu is open (so it can still be dragged / collapsed).");
+                                  "Fixer menu is open (so it can still be dragged / collapsed)\n"
+                                  "or while the window is out of the game (its gear menu).");
 
             ImGui::SetNextItemWidth(200.0f);
             ImGui::SliderFloat("Opacity##rswin", &m_RuneshapeWinAlpha, 0.1f, 1.0f, "%.2f");
@@ -1837,8 +1839,11 @@ private:
         // window isn't submitted then, so it can't refresh) — the window stays
         // gone until the cursor leaves that area, preventing show/hide flicker.
         // Never applied while the Fixer menu is open, so the window can still be
-        // configured, dragged and collapsed from the menu.
-        if (m_RuneshapeWinHideOnHover && !menuVisible && m_RuneshapeWinRectValid) {
+        // configured, dragged and collapsed from the menu, and never out of the
+        // game (the rect and the mouse are game-client pixels; last frame's mode,
+        // as this runs before the window).
+        if (m_RuneshapeWinHideOnHover && !menuVisible && !m_RuneshapeWinDetached &&
+            m_RuneshapeWinRectValid) {
             const ImVec2 mp = ImGui::GetIO().MousePos;
             if (mp.x >= m_RuneshapeWinRectMin.x && mp.x < m_RuneshapeWinRectMax.x &&
                 mp.y >= m_RuneshapeWinRectMin.y && mp.y < m_RuneshapeWinRectMax.y) {
@@ -1848,13 +1853,14 @@ private:
         }
 
         // Render only when there's something to show or the menu is open.
-        // While rendered, request interactive overlay input so the title-bar
-        // header can be dragged / collapsed even in pure overlay mode: the host
-        // (radar/render UpdateInput) only lifts WS_EX_TRANSPARENT while the
-        // cursor is over a hit-testable (non-NoInputs) window, and treats a
-        // collapsed window's title bar as hit-testable.
+        // While rendered in game, request interactive overlay input so the
+        // title-bar header can be dragged / collapsed even in pure overlay mode:
+        // the host (radar/render UpdateInput) only lifts WS_EX_TRANSPARENT while
+        // the cursor is over a hit-testable (non-NoInputs) window, and treats a
+        // collapsed window's title bar as hit-testable. Out of the game the window
+        // takes the mouse by itself, so no overlay input is wished for it.
         const bool render = !(rs.empty() && !menuVisible);
-        ctx()->Overlay.SetWantsOverlayInput(render);
+        ctx()->Overlay.SetWantsOverlayInput(render && !m_RuneshapeWinDetached);
         if (!render) return;
 
         // Title bar (drag handle) + collapse arrow are intentionally ENABLED.
@@ -1867,46 +1873,41 @@ private:
                                  ImGuiWindowFlags_NoFocusOnAppearing |
                                  ImGuiWindowFlags_NoScrollbar;
 
+        // The host owns the window's place, collapse state and gear menu (lock,
+        // in / out of game, reset position, close). The old position fields only
+        // seed its store once. Close (the title-bar X or the gear) clears
+        // m_ShowRuneshapeWindow: re-enable via the "Runeshape window" checkbox.
+        PluginSDK::InfoWindowOptions o;
+        o.id = "runeshape";
+        o.title = "Runeshape";
+        o.flags = flags;
+        o.defaultPos = ImVec2(100.0f, 100.0f);
+        o.legacyPos = ImVec2(m_RuneshapeWinX, m_RuneshapeWinY);
+        o.legacyCollapsed = m_RuneshapeWinCollapsed ? 1 : 0;
+
         ImGui::SetNextWindowBgAlpha(m_RuneshapeWinAlpha);
-        ImGui::SetNextWindowPos(ImVec2(m_RuneshapeWinX, m_RuneshapeWinY),
-                                ImGuiCond_Appearing);
-        ImGui::SetNextWindowCollapsed(m_RuneshapeWinCollapsed, ImGuiCond_Appearing);
-
-        // Begin returns false when the window is collapsed — still save pos +
-        // the collapsed state, then bail (the title bar remains interactive).
-        // Title-bar X closes the window: re-enable via the "Runeshape window"
-        // checkbox in the plugin settings.
-        bool keepOpen = true;
-        const bool open = ImGui::Begin("Runeshape###RuneshapeWindow", &keepOpen, flags);
-        m_RuneshapeWinCollapsed = !open;
-
-        // Remember the on-screen rect (collapsed => title bar only) for the
-        // hide-on-hover check above — it runs BEFORE Begin() next frame.
         {
-            const ImVec2 wp = ImGui::GetWindowPos();
-            const ImVec2 ws = ImGui::GetWindowSize();
-            m_RuneshapeWinRectMin = wp;
-            m_RuneshapeWinRectMax = ImVec2(wp.x + ws.x, wp.y + ws.y);
-            m_RuneshapeWinRectValid = true;
-        }
-
-        if (!keepOpen) {
-            m_ShowRuneshapeWindow = false;
-            SaveSettings();
-            ImGui::End();
-            return;
-        }
-        {
-            ImVec2 wp = ImGui::GetWindowPos();
-            if (wp.x != m_RuneshapeWinX || wp.y != m_RuneshapeWinY) {
-                m_RuneshapeWinX = wp.x; m_RuneshapeWinY = wp.y;
+            PluginSDK::InfoWindow window(ctx()->Overlay, o, &m_ShowRuneshapeWindow);
+            const bool began = window.Began();   // also collapsed
+            if (began) m_RuneshapeWinDetached = window.Detached();
+            // Remember the in-game rect (collapsed => title bar only) for the
+            // hide-on-hover check above — it runs BEFORE the window next frame.
+            if (began && !window.Detached()) {
+                const ImVec2 wp = ImGui::GetWindowPos();
+                const ImVec2 ws = ImGui::GetWindowSize();
+                m_RuneshapeWinRectMin = wp;
+                m_RuneshapeWinRectMax = ImVec2(wp.x + ws.x, wp.y + ws.y);
+                m_RuneshapeWinRectValid = true;
+            } else if (began) {
+                m_RuneshapeWinRectValid = false;
             }
+            if (window) DrawRuneshapeWindowContents(rs);
         }
-        if (!open) {
-            ImGui::End();
-            return;
-        }
+        if (!m_ShowRuneshapeWindow) SaveSettings();   // closed from the title-bar X or the gear menu
+    }
 
+    // The Runeshape window's contents (the window itself is open; DrawRuneshapeWindow).
+    void DrawRuneshapeWindowContents(const std::vector<PluginSDK::Runeshape>& rs) {
         // Fetch rates once for the whole window render.
         auto rates = ctx()->Prices.GetRates();
         float divInChaos  = (rates.divineInChaos  > 0.0f) ? rates.divineInChaos  : m_CachedDivineInChaos;
@@ -2250,8 +2251,6 @@ private:
                 ImGui::Spacing();
             }
         }
-
-        ImGui::End();
     }
 
     // ========================================================================
@@ -2648,10 +2647,16 @@ private:
 
     // ---- Runeshape movable window ----
     bool  m_ShowRuneshapeWindow = true;
+    // Position and collapse state from before POEFixer 366. Only read now: they seed
+    // the host's window store once (InfoWindowOptions::legacyPos / legacyCollapsed) and
+    // place the window on an older host. Still loaded and saved unchanged.
     float m_RuneshapeWinX = 100.0f;
     float m_RuneshapeWinY = 100.0f;
     float m_RuneshapeWinAlpha = 0.85f;
-    bool  m_RuneshapeWinCollapsed = false;   // persisted collapse state of the window
+    bool  m_RuneshapeWinCollapsed = false;
+    // The window was drawn out of the game last frame (gear -> Game overlay mode off).
+    // Read before the window: hide-on-hover and the overlay-input wish are in-game only.
+    bool  m_RuneshapeWinDetached = false;
     std::unordered_set<uint32_t> m_RuneshapeCollapsed; // persisted per-element collapse (keyed by color)
 
     // Advanced overlay settings (Overlay Toggles -> "Runeshape window: advanced").
@@ -2667,8 +2672,8 @@ private:
     bool  m_RsShowRowQty    = true;              // rows: xN quantity
     bool  m_RsShowRowPrice  = true;              // rows: price
     bool  m_RsShowRowPropRunes = true;           // rows: propagating (yellow-glow) runes
-    // Last on-screen window rect for hide-on-hover. Deliberately KEPT while the
-    // window is hover-hidden (it isn't submitted then, so it can't refresh) —
+    // Last on-screen window rect for hide-on-hover (in game only). Deliberately KEPT
+    // while the window is hover-hidden (it isn't submitted then, so it can't refresh) —
     // the window stays hidden until the cursor leaves this area (no flicker).
     ImVec2 m_RuneshapeWinRectMin = ImVec2(0.0f, 0.0f);
     ImVec2 m_RuneshapeWinRectMax = ImVec2(0.0f, 0.0f);
@@ -2728,6 +2733,6 @@ extern "C" PLUGIN_API void DestroyPlugin(PluginSDK::Plugin* plugin) {
 POEFIXER_PLUGIN_INFO(
     "NinjaPricer",
     "Ninja Pricer",
-    "1.0.1",
+    "1.0.2",
     "POEFixer",
     "Shows item prices on dropped items, in your inventory and stash, in the Ritual shop and on Runeshape rewards.")

@@ -1,8 +1,8 @@
 # NinjaPricer — Item Price Overlay Plugin
 
-Current version: 1.0.1
+Current version: 1.0.2
 
-Requires POE2Fixer 364 or newer.
+Requires POE2Fixer 366 or newer.
 
 An item price overlay for POE2Fixer: prices appear directly on dropped items, in your
 inventory and in the open stash tab, plus Ritual shop and Runeshape rewards.
