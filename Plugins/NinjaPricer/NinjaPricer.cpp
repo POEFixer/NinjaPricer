@@ -4,12 +4,18 @@
 // Displays item prices from the host PriceService on dropped items and
 // in inventory. All price loading is owned by the host; this plugin only
 // queries ctx()->Prices.
+//
+// Texts follow the program language (PluginI18n.h): lang/<code>.json next to the
+// DLL, English compiled in through lang_en.generated.h (python
+// tools/plugin_i18n/gen.py Plugins/NinjaPricer after editing lang/en.json).
 // ============================================================================
 
 #include "../../POEFixer/plugin_sdk/PluginSDK.h"
+#include "lang_en.generated.h"   // the embedded English: once per DLL, after PluginSDK.h
 #include "../../POEFixer/plugin_sdk/PluginInfoWindow.h"
 #include "../../POEFixer/imgui/imgui.h"
 #include <d3d11.h>
+#include <sal.h>
 
 // stb_image for loading currency icon PNGs (image price-display style).
 // Implementation lives in this single plugin TU.
@@ -18,6 +24,7 @@
 #include "../../POEFixer/imgui/stb_image.h"
 
 #include "lib/nlohmann/json.hpp"
+#include "RuneshapeLabel.h"
 
 #include <array>
 #include <fstream>
@@ -32,9 +39,45 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <limits>
+
+namespace I18n = PluginSDK::I18n;
+
+// Helpers for the translated texts (see Plugins/ExamplePlugin/examples/Text.h).
+namespace NinjaPricerText {
+
+// printf for a TrF argument: Num("%.1f", value). The format is code, never a translation.
+inline std::string Num(_In_z_ _Printf_format_string_ const char* format, ...) {
+    char buf[128];
+    va_list args;
+    va_start(args, format);
+    std::vsnprintf(buf, sizeof(buf), format, args);
+    va_end(args);
+    return buf;
+}
+
+// One line of a text TrF built (TextUnformatted: a translation is no format).
+inline void Show(const std::string& text) { ImGui::TextUnformatted(text.c_str()); }
+
+// A wrapped tooltip for the item just drawn, while it is hovered.
+inline void Tooltip(const char* text) {
+    if (!ImGui::IsItemHovered()) return;
+    ImGui::BeginTooltip();
+    ImGui::PushTextWrapPos(ImGui::GetFontSize() * 30.0f);
+    ImGui::TextUnformatted(text);
+    ImGui::PopTextWrapPos();
+    ImGui::EndTooltip();
+}
+
+inline const char* YesNo(bool value) { return value ? I18n::Tr("common_yes") : I18n::Tr("common_no"); }
+
+} // namespace NinjaPricerText
+
+using NinjaPricerText::Num;
+using NinjaPricerText::Show;
 
 // Host-synthesized inventory ID for the Ritual shop ("Favours" window). The
 // host's ScanInventoryGrid publishes the shop grid under this ID (it is not a
@@ -65,7 +108,10 @@ enum class UiPricePosition : int {
     BottomLeft = 2,
     BottomRight = 3,
 };
-static const char* kUiPositionNames[] = { "Top-Left", "Top-Right", "Bottom-Left", "Bottom-Right" };
+static constexpr const char* kUiPositionKeys[] = {
+    I18n::Key("position_top_left"), I18n::Key("position_top_right"),
+    I18n::Key("position_bottom_left"), I18n::Key("position_bottom_right"),
+};
 
 // Price text position for ground items
 enum class GroundPricePosition : int {
@@ -74,7 +120,10 @@ enum class GroundPricePosition : int {
     Left = 2,
     Right = 3,
 };
-static const char* kGroundPositionNames[] = { "Top", "Bottom", "Left", "Right" };
+static constexpr const char* kGroundPositionKeys[] = {
+    I18n::Key("position_top"), I18n::Key("position_bottom"),
+    I18n::Key("position_left"), I18n::Key("position_right"),
+};
 
 // How the price value is rendered: as text with a currency-letter suffix
 // ("2.5 D"), or as the numeric value followed by the currency icon ("2.5" + img).
@@ -82,7 +131,9 @@ enum class PriceDisplayStyle : int {
     Image = 0,   // value + currency icon (default)
     Text  = 1,   // value + letter suffix
 };
-static const char* kPriceDisplayStyleNames[] = { "Image (icon)", "Text" };
+static constexpr const char* kPriceDisplayStyleKeys[] = {
+    I18n::Key("style_image"), I18n::Key("style_text"),
+};
 
 // Display currency choice (local to NinjaPricer; not from the deleted headers).
 // Ordinal matches SDK PriceResult fields: 0=Divine, 1=Exalted, 2=Chaos.
@@ -93,8 +144,9 @@ enum class DisplayCurrency : int {
 };
 
 static constexpr const char* kMinimumPriceKeys[] = { "divine", "exalted", "chaos" };
-static constexpr const char* kMinimumPriceLabels[] = {
-    "Minimum price (Divine)", "Minimum price (Exalted)", "Minimum price (Chaos)"
+static constexpr const char* kMinimumPriceLabelKeys[] = {
+    I18n::Key("display_minimum_divine"), I18n::Key("display_minimum_exalted"),
+    I18n::Key("display_minimum_chaos"),
 };
 
 // ============================================================================
@@ -232,25 +284,28 @@ inline int Capture(const KeyState& down, KeyState& ignoredDown) {
 
 } // namespace NinjaPricerHotkeys
 
-// Virtual key name helper
-static const char* GetVkName(int vk) {
-    if (vk == 0) return "None";
+// Virtual key name helper. The key's own name comes from Windows in the system's
+// language: read it wide and pass it on as UTF-8 (the ANSI name of a Russian or
+// Chinese keyboard layout is no UTF-8).
+static std::string GetVkName(int vk) {
+    if (vk == 0) return I18n::Tr("hotkey_none");
     switch (vk) {
-    case VK_LBUTTON: return "LMouse";
-    case VK_RBUTTON: return "RMouse";
-    case VK_MBUTTON: return "MMouse";
-    case VK_XBUTTON1: return "Mouse4";
-    case VK_XBUTTON2: return "Mouse5";
+    case VK_LBUTTON: return I18n::Tr("hotkey_mouse_left");
+    case VK_RBUTTON: return I18n::Tr("hotkey_mouse_right");
+    case VK_MBUTTON: return I18n::Tr("hotkey_mouse_middle");
+    case VK_XBUTTON1: return I18n::Tr("hotkey_mouse_4");
+    case VK_XBUTTON2: return I18n::Tr("hotkey_mouse_5");
     default: break;
     }
-    static char buf[64];
-    UINT scanCode = MapVirtualKeyA(vk, MAPVK_VK_TO_VSC);
-    char keyName[32] = {};
-    if (GetKeyNameTextA(static_cast<LONG>(scanCode) << 16, keyName, sizeof(keyName)) > 0)
-        snprintf(buf, sizeof(buf), "%s (0x%02X)", keyName, vk);
-    else
-        snprintf(buf, sizeof(buf), "Key 0x%02X", vk);
-    return buf;
+    const std::string code = Num("0x%02X", vk);
+    const UINT scanCode = MapVirtualKeyW(static_cast<UINT>(vk), MAPVK_VK_TO_VSC);
+    wchar_t wideName[64] = {};
+    if (GetKeyNameTextW(static_cast<LONG>(scanCode) << 16, wideName, 64) > 0) {
+        char keyName[256] = {};
+        if (WideCharToMultiByte(CP_UTF8, 0, wideName, -1, keyName, sizeof(keyName), nullptr, nullptr) > 0)
+            return std::string(keyName) + " (" + code + ")";
+    }
+    return I18n::TrF("hotkey_key_code", { { "code", code } });
 }
 
 class NinjaPricerPlugin : public PluginSDK::Plugin {
@@ -289,19 +344,19 @@ public:
 
         if (!ImGui::BeginTabBar("##NinjaPricerTabs")) return;
 
-        if (ImGui::BeginTabItem("Data Source")) {
+        if (ImGui::BeginTabItem(I18n::TrId("tab_data_source"))) {
             DrawTabDataSource();
             ImGui::EndTabItem();
         }
-        if (ImGui::BeginTabItem("Display Settings")) {
+        if (ImGui::BeginTabItem(I18n::TrId("tab_display"))) {
             DrawTabDisplaySettings();
             ImGui::EndTabItem();
         }
-        if (ImGui::BeginTabItem("Overlay Toggles")) {
+        if (ImGui::BeginTabItem(I18n::TrId("tab_overlay"))) {
             DrawTabOverlayToggles();
             ImGui::EndTabItem();
         }
-        if (ImGui::BeginTabItem("Debug")) {
+        if (ImGui::BeginTabItem(I18n::TrId("tab_debug"))) {
             DrawDebugPanel();
             ImGui::EndTabItem();
         }
@@ -313,10 +368,7 @@ public:
         ImGui::Spacing();
 
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.85f, 0.2f, 1.0f));
-        ImGui::TextWrapped(
-            "Warning: POE2 must be set to English. Item names are matched "
-            "in English only - other languages will not work."
-        );
+        ImGui::TextWrapped("%s", I18n::Tr("source_english_warning"));
         ImGui::PopStyleColor();
         ImGui::Spacing();
         ImGui::Separator();
@@ -324,61 +376,68 @@ public:
 
         // Read-only status from the host price service.
         auto st = ctx()->Prices.GetStatus();
-        ImGui::Text("Prices: %s   Items: %d", st.loaded ? "loaded" : "loading...", st.totalItems);
+        ImGui::TextUnformatted(st.loaded ? I18n::Tr("source_prices_loaded") : I18n::Tr("source_prices_loading"));
+        ImGui::SameLine(0.0f, ImGui::GetFontSize());
+        Show(I18n::TrF("source_item_count", { { "count", Num("%d", st.totalItems) } }));
 
         if (st.loaded) {
-            ImGui::Text("Rates: 1 Divine = %.1f Chaos | 1 Exalted = %.1f Chaos",
-                st.divineInChaos, st.exaltedInChaos);
+            ImGui::TextUnformatted(I18n::Tr("source_rates"));
+            ImGui::SameLine();
+            Show(I18n::TrF("source_rate_divine", { { "value", Num("%.1f", st.divineInChaos) } }));
+            ImGui::SameLine();
+            ImGui::TextDisabled("|");
+            ImGui::SameLine();
+            Show(I18n::TrF("source_rate_exalted", { { "value", Num("%.1f", st.exaltedInChaos) } }));
         }
         // Disabled colour + wrapping: TextDisabled never wraps and this line is wider than
         // the settings window at its default width.
         ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
-        ImGui::TextWrapped("Price source and league are chosen in Settings -> Prices (host); this plugin follows that choice.");
+        ImGui::TextWrapped("%s", I18n::Tr("source_follows_host"));
         ImGui::PopStyleColor();
     }
 
     void DrawTabDisplaySettings() {
         ImGui::Spacing();
 
-        ImGui::Text("Value Display:");
+        ImGui::TextUnformatted(I18n::Tr("display_value_currency"));
         int dc = static_cast<int>(m_DisplayCurrency);
-        bool displayChanged = ImGui::RadioButton("Divine (D)", &dc, 0); ImGui::SameLine();
-        displayChanged |= ImGui::RadioButton("Exalted (E)", &dc, 1); ImGui::SameLine();
-        displayChanged |= ImGui::RadioButton("Chaos (C)", &dc, 2);
+        bool displayChanged = ImGui::RadioButton(I18n::TrId("display_divine"), &dc, 0); ImGui::SameLine();
+        displayChanged |= ImGui::RadioButton(I18n::TrId("display_exalted"), &dc, 1); ImGui::SameLine();
+        displayChanged |= ImGui::RadioButton(I18n::TrId("display_chaos"), &dc, 2);
         m_DisplayCurrency = static_cast<DisplayCurrency>(dc);
 
         ImGui::Spacing();
         for (size_t i = 0; i < m_MinimumPrices.size(); ++i) {
-            ImGui::SetNextItemWidth(160.0f);
-            if (ImGui::InputFloat(kMinimumPriceLabels[i], &m_MinimumPrices[i], 0.0f, 0.0f, "%.3f")) {
+            ImGui::SetNextItemWidth(ImGui::GetFontSize() * 10.0f);
+            if (ImGui::InputFloat(I18n::TrId(kMinimumPriceLabelKeys[i]), &m_MinimumPrices[i], 0.0f, 0.0f, "%.3f")) {
                 if (!std::isfinite(m_MinimumPrices[i]) || m_MinimumPrices[i] < 0.0f)
                     m_MinimumPrices[i] = 0.0f;
                 displayChanged = true;
             }
         }
-        ImGui::TextWrapped("Each currency keeps its own minimum. Prices use the total stack or reward value; 0 disables the minimum.");
-        ImGui::TextWrapped("Price labels are hidden on the selected currency itself.");
+        ImGui::TextWrapped("%s", I18n::Tr("display_minimum_hint"));
+        ImGui::TextWrapped("%s", I18n::Tr("display_own_currency_hint"));
         if (displayChanged) InvalidateDisplayCaches();
 
         ImGui::Spacing();
-        ImGui::Text("Price style:");
+        ImGui::TextUnformatted(I18n::Tr("display_price_style"));
         int ps = static_cast<int>(m_PriceDisplayStyle);
-        ImGui::RadioButton(kPriceDisplayStyleNames[0], &ps, 0); ImGui::SameLine();
-        ImGui::RadioButton(kPriceDisplayStyleNames[1], &ps, 1);
+        ImGui::RadioButton(I18n::TrId(kPriceDisplayStyleKeys[0]), &ps, 0); ImGui::SameLine();
+        ImGui::RadioButton(I18n::TrId(kPriceDisplayStyleKeys[1]), &ps, 1);
         m_PriceDisplayStyle = static_cast<PriceDisplayStyle>(ps);
         ImGui::SameLine();
-        ImGui::TextDisabled("(icon = value + currency image)");
+        ImGui::TextDisabled("%s", I18n::Tr("display_price_style_hint"));
 
-        ImGui::SliderFloat("Text size", &m_TextScale, 0.5f, 2.0f, "%.1f");
+        ImGui::SliderFloat(I18n::TrId("display_text_size"), &m_TextScale, 0.5f, 2.0f, "%.1f");
 
         ImGui::Separator();
 
-        ImGui::SetNextItemWidth(160.0f);
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 10.0f);
         int uiPos = static_cast<int>(m_UiPricePosition);
-        if (ImGui::BeginCombo("Price position (Inventory/Stash)", kUiPositionNames[uiPos])) {
+        if (ImGui::BeginCombo(I18n::TrId("display_position_inventory"), I18n::Tr(kUiPositionKeys[uiPos]))) {
             for (int i = 0; i < 4; i++) {
                 bool selected = (uiPos == i);
-                if (ImGui::Selectable(kUiPositionNames[i], selected))
+                if (ImGui::Selectable(I18n::TrId(kUiPositionKeys[i]), selected))
                     uiPos = i;
                 if (selected) ImGui::SetItemDefaultFocus();
             }
@@ -386,12 +445,12 @@ public:
         }
         m_UiPricePosition = static_cast<UiPricePosition>(uiPos);
 
-        ImGui::SetNextItemWidth(160.0f);
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 10.0f);
         int gndPos = static_cast<int>(m_GroundPricePosition);
-        if (ImGui::BeginCombo("Price position (Ground items)", kGroundPositionNames[gndPos])) {
+        if (ImGui::BeginCombo(I18n::TrId("display_position_ground"), I18n::Tr(kGroundPositionKeys[gndPos]))) {
             for (int i = 0; i < 4; i++) {
                 bool selected = (gndPos == i);
-                if (ImGui::Selectable(kGroundPositionNames[i], selected))
+                if (ImGui::Selectable(I18n::TrId(kGroundPositionKeys[i]), selected))
                     gndPos = i;
                 if (selected) ImGui::SetItemDefaultFocus();
             }
@@ -415,11 +474,10 @@ public:
 
     bool DrawHotkeyCaptureRow(const char* label, const char* idSuffix, int& vk) {
         bool boundNow = false;
-        ImGui::Text("%s", label);
+        ImGui::TextUnformatted(label);
         ImGui::SameLine();
         if (m_CaptureTarget == &vk) {
-            ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, 1.0f),
-                "Press any key... (ESC to cancel)");
+            ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, 1.0f), "%s", I18n::Tr("hotkey_press_any_key"));
             NinjaPricerHotkeys::KeyState down{};
             for (int key = 0; key < static_cast<int>(down.size()); ++key)
                 down[static_cast<size_t>(key)] = (GetAsyncKeyState(key) & 0x8000) != 0;
@@ -435,16 +493,16 @@ public:
             }
         }
         else {
-            ImGui::Text("%s", GetVkName(vk));
+            Show(GetVkName(vk));
             ImGui::SameLine();
-            char btn[48];
-            snprintf(btn, sizeof(btn), "Set Hotkey##%s", idSuffix);
-            if (ImGui::Button(btn, ImVec2(100.0f, 0.0f)))
+            // The ids stay "###hotkey_set_<row>" / "###hotkey_clear_<row>" in every language.
+            const std::string setLabel = std::string(I18n::Tr("hotkey_set")) + "###hotkey_set_" + idSuffix;
+            if (ImGui::Button(setLabel.c_str()))
                 BeginHotkeyCapture(&vk);
             if (vk != 0) {
                 ImGui::SameLine();
-                snprintf(btn, sizeof(btn), "Clear##%s", idSuffix);
-                if (ImGui::Button(btn, ImVec2(60.0f, 0.0f)))
+                const std::string clearLabel = std::string(I18n::Tr("hotkey_clear")) + "###hotkey_clear_" + idSuffix;
+                if (ImGui::Button(clearLabel.c_str()))
                     vk = 0;
             }
         }
@@ -454,93 +512,89 @@ public:
     void DrawTabOverlayToggles() {
         ImGui::Spacing();
 
-        ImGui::Checkbox("Show prices on dropped items", &m_ShowGroundPrices);
+        ImGui::Checkbox(I18n::TrId("overlay_ground"), &m_ShowGroundPrices);
 
-        ImGui::Checkbox("Show prices in inventory", &m_ShowInventoryPrices);
+        ImGui::Checkbox(I18n::TrId("overlay_inventory"), &m_ShowInventoryPrices);
         ImGui::SameLine();
-        ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f), "(may affect FPS)");
+        ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f), "%s", I18n::Tr("overlay_fps_note"));
 
-        ImGui::Checkbox("Show prices in stash", &m_ShowOtherInventoryPrices);
+        ImGui::Checkbox(I18n::TrId("overlay_stash"), &m_ShowOtherInventoryPrices);
         ImGui::SameLine();
-        ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f), "(may affect FPS)");
+        ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f), "%s", I18n::Tr("overlay_fps_note"));
 
-        ImGui::Checkbox("Ritual", &m_ShowRitualPrices);
+        ImGui::Checkbox(I18n::TrId("overlay_ritual"), &m_ShowRitualPrices);
         ImGui::SameLine();
-        ImGui::TextDisabled("(price items in the Ritual \"Favours\" shop)");
+        ImGui::TextDisabled("%s", I18n::Tr("overlay_ritual_hint"));
 
-        ImGui::Checkbox("Runeshape", &m_ShowRuneshapePrices);
+        ImGui::Checkbox(I18n::TrId("overlay_runeshape"), &m_ShowRuneshapePrices);
         ImGui::SameLine();
-        ImGui::TextDisabled("(price rewards in the Runeshape Combinations panel)");
+        ImGui::TextDisabled("%s", I18n::Tr("overlay_runeshape_hint"));
 
-        ImGui::Checkbox("Runeshape window", &m_ShowRuneshapeWindow);
+        ImGui::Checkbox(I18n::TrId("overlay_runeshape_window"), &m_ShowRuneshapeWindow);
         ImGui::SameLine();
-        ImGui::TextDisabled("(movable overlay listing each Runeshape with prices)");
+        ImGui::TextDisabled("%s", I18n::Tr("overlay_runeshape_window_hint"));
 
         // Advanced settings for the Runeshape window. Always visible (not gated
         // on the checkbox above) so the toggle hotkey stays discoverable while
         // the window is hidden.
         ImGui::Indent();
-        if (ImGui::TreeNode("Runeshape window: advanced settings")) {
+        if (ImGui::TreeNode(I18n::TrId("rswin_advanced"))) {
             ImGui::Spacing();
 
-            if (DrawHotkeyCaptureRow("Show/hide hotkey:", "rswin", m_RuneshapeWinHotkey))
+            if (DrawHotkeyCaptureRow(I18n::Tr("rswin_hotkey"), "rswin", m_RuneshapeWinHotkey))
                 m_RuneshapeWinHotkeyWasDown = true;   // key is down right now — don't fire the toggle
 
-            ImGui::Checkbox("Hide on mouse hover", &m_RuneshapeWinHideOnHover);
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("The overlay disappears while the mouse cursor is over it and\n"
-                                  "reappears when the cursor leaves. Not applied while the\n"
-                                  "Fixer menu is open (so it can still be dragged / collapsed)\n"
-                                  "or while the window is out of the game (its gear menu).");
+            ImGui::Checkbox(I18n::TrId("rswin_hide_on_hover"), &m_RuneshapeWinHideOnHover);
+            NinjaPricerText::Tooltip(I18n::Tr("rswin_hide_on_hover_tip"));
 
-            ImGui::SetNextItemWidth(200.0f);
-            ImGui::SliderFloat("Opacity##rswin", &m_RuneshapeWinAlpha, 0.1f, 1.0f, "%.2f");
+            ImGui::SetNextItemWidth(ImGui::GetFontSize() * 12.0f);
+            ImGui::SliderFloat(I18n::TrId("rswin_opacity"), &m_RuneshapeWinAlpha, 0.1f, 1.0f, "%.2f");
 
             ImGui::Spacing();
-            ImGui::Text("Price display:");
+            ImGui::TextUnformatted(I18n::Tr("rswin_price_display"));
             ImGui::SameLine();
             int rsps = static_cast<int>(m_RuneshapeWinPriceStyle);
-            ImGui::RadioButton("Currency icon##rswin", &rsps, 0);
+            ImGui::RadioButton(I18n::TrId("rswin_price_icon"), &rsps, 0);
             ImGui::SameLine();
-            ImGui::RadioButton("Text##rswin", &rsps, 1);
+            ImGui::RadioButton(I18n::TrId("rswin_price_text"), &rsps, 1);
             m_RuneshapeWinPriceStyle = static_cast<PriceDisplayStyle>(rsps);
             ImGui::SameLine();
-            ImGui::TextDisabled("(reward rows + header best reward)");
+            ImGui::TextDisabled("%s", I18n::Tr("rswin_price_hint"));
 
             ImGui::Spacing();
-            ImGui::TextDisabled("Header elements:");
-            ImGui::Checkbox("Color square", &m_RsShowHdrColor);
+            ImGui::TextDisabled("%s", I18n::Tr("rswin_header_elements"));
+            ImGui::Checkbox(I18n::TrId("rswin_color_square"), &m_RsShowHdrColor);
             ImGui::SameLine();
-            ImGui::Checkbox("Rune sockets", &m_RsShowHdrRunes);
+            ImGui::Checkbox(I18n::TrId("rswin_rune_sockets"), &m_RsShowHdrRunes);
             ImGui::SameLine();
-            ImGui::Checkbox("Best reward price", &m_RsShowHdrBest);
+            ImGui::Checkbox(I18n::TrId("rswin_best_price"), &m_RsShowHdrBest);
 
-            ImGui::TextDisabled("Expanded list elements:");
-            ImGui::Checkbox("Reward icon", &m_RsShowRowIcon);
+            ImGui::TextDisabled("%s", I18n::Tr("rswin_list_elements"));
+            ImGui::Checkbox(I18n::TrId("rswin_reward_icon"), &m_RsShowRowIcon);
             ImGui::SameLine();
-            ImGui::Checkbox("Reward name", &m_RsShowRowName);
+            ImGui::Checkbox(I18n::TrId("rswin_reward_name"), &m_RsShowRowName);
             ImGui::SameLine();
-            ImGui::Checkbox("Reward quantity", &m_RsShowRowQty);
-            ImGui::Checkbox("Price##rswinrow", &m_RsShowRowPrice);
+            ImGui::Checkbox(I18n::TrId("rswin_reward_quantity"), &m_RsShowRowQty);
+            ImGui::Checkbox(I18n::TrId("rswin_reward_price"), &m_RsShowRowPrice);
             ImGui::SameLine();
-            ImGui::Checkbox("Propagating runes (yellow glow)", &m_RsShowRowPropRunes);
+            ImGui::Checkbox(I18n::TrId("rswin_propagating_runes"), &m_RsShowRowPropRunes);
 
             ImGui::Spacing();
             ImGui::TreePop();
         }
         ImGui::Unindent();
 
-        ImGui::Checkbox("Runeshape weights", &m_ShowRuneshapeWeights);
+        ImGui::Checkbox(I18n::TrId("overlay_runeshape_weights"), &m_ShowRuneshapeWeights);
         ImGui::SameLine();
-        ImGui::TextDisabled("(total rune weight per combination; edit weights in Radar -> RuneShape)");
+        ImGui::TextDisabled("%s", I18n::Tr("overlay_runeshape_weights_hint"));
 
-        ImGui::Checkbox("Show item icons", &m_ShowItemIcons);
+        ImGui::Checkbox(I18n::TrId("overlay_item_icons"), &m_ShowItemIcons);
 
-        ImGui::Checkbox("Hide when game not focused", &m_HideWhenUnfocused);
+        ImGui::Checkbox(I18n::TrId("overlay_hide_unfocused"), &m_HideWhenUnfocused);
 
         ImGui::Separator();
 
-        DrawHotkeyCaptureRow("Hold-to-hide hotkey:", "hold", m_HideHotkey);
+        DrawHotkeyCaptureRow(I18n::Tr("overlay_hold_hotkey"), "hold", m_HideHotkey);
     }
 
     // ========================================================================
@@ -579,6 +633,7 @@ public:
             m_CachedInventories.clear();
             m_RarityCache.clear();
             m_PriceCache.clear();
+            m_ItemPriceCache.clear();
             m_GroundTags.clear();
             m_GroundResolveCache.clear();
             m_LastInventoryScan = {};   // force immediate refresh in new area
@@ -627,7 +682,7 @@ public:
             }
         }
 
-        // Reset per-frame perf accumulators (TimedLookup feeds these).
+        // Reset per-frame perf accumulators (TimedItemLookup feeds these).
         m_PerfLookupMs = 0.0;
         m_PerfLookupExact = m_PerfLookupMiss = 0;
 
@@ -806,6 +861,7 @@ private:
         // Resolved items and display tags retain prices independently. Invalidate all of
         // them together so a new snapshot or selection is visible on the next frame.
         m_PriceCache.clear();
+        m_ItemPriceCache.clear();
         m_GroundResolveCache.clear();
         m_GroundTags.clear();
         m_RuneshapeRows.clear();
@@ -822,44 +878,55 @@ private:
     // cost lives separately in the app's Debug -> DataVis -> "Inventory Scan".
     void DrawPerfSection() {
         ImGui::Spacing();
-        ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f), "Performance (render thread):");
+        ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f), "%s", I18n::Tr("debug_perf_title"));
 
         // The single knob most likely to affect perceived latency. Lower it and
         // watch whether the delay shrinks — if it does and the timings below stay
         // low, the bottleneck was the throttle, not the read.
-        ImGui::SetNextItemWidth(220.0f);
-        ImGui::SliderInt("Inventory scan interval (ms)", &m_PerfScanIntervalMs, 50, 2000);
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 14.0f);
+        ImGui::SliderInt(I18n::TrId("debug_scan_interval"), &m_PerfScanIntervalMs, 50, 2000);
         ImGui::SameLine();
-        ImGui::TextDisabled("(default 100; at least 250 while no priced panel is open)");
+        ImGui::TextDisabled("%s", I18n::Tr("debug_scan_interval_hint"));
 
+        // One row per timing: a label column fitted to the translated labels, then the
+        // value (a fixed-fit table without Resizable fits both every frame).
         auto row = [](const char* label, double last, double peak, double warn, double bad) {
             ImVec4 c = (peak > bad) ? ImVec4(1.0f, 0.35f, 0.35f, 1.0f)
                      : (peak > warn) ? ImVec4(1.0f, 0.85f, 0.2f, 1.0f)
                      : ImVec4(0.5f, 0.9f, 0.5f, 1.0f);
-            ImGui::Text("  %-26s", label);
-            ImGui::SameLine(240);
-            ImGui::TextColored(c, "%.3f ms   (peak %.3f ms)", last, peak);
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(label);
+            ImGui::TableNextColumn();
+            const std::string timing = I18n::TrF("debug_perf_timing",
+                { { "last", Num("%.3f", last) }, { "peak", Num("%.3f", peak) } });
+            ImGui::TextColored(c, "%s", timing.c_str());
         };
 
         ImGui::Spacing();
-        row("Scan() request:",     m_PerfScanCallMs, m_PerfPeakScanCallMs, 0.5, 2.0);
-        row("GetAll() (ABI):",     m_PerfGetAllMs,   m_PerfPeakGetAllMs,   1.0, 5.0);
-        row("DrawInventory/frame:",m_PerfDrawInvMs,  m_PerfPeakDrawInvMs,  1.0, 4.0);
-        row("DrawGround/frame:",   m_PerfGroundMs,   m_PerfPeakGroundMs,   1.0, 4.0);
-        row("LookupPrice/frame:",  m_PerfLookupMs,   m_PerfPeakLookupMs,   0.5, 3.0);
+        ImGui::Indent();
+        if (ImGui::BeginTable("##perf", 2, ImGuiTableFlags_SizingFixedFit)) {
+            row(I18n::Tr("debug_perf_scan"),           m_PerfScanCallMs, m_PerfPeakScanCallMs, 0.5, 2.0);
+            row(I18n::Tr("debug_perf_get_all"),        m_PerfGetAllMs,   m_PerfPeakGetAllMs,   1.0, 5.0);
+            row(I18n::Tr("debug_perf_draw_inventory"), m_PerfDrawInvMs,  m_PerfPeakDrawInvMs,  1.0, 4.0);
+            row(I18n::Tr("debug_perf_draw_ground"),    m_PerfGroundMs,   m_PerfPeakGroundMs,   1.0, 4.0);
+            row(I18n::Tr("debug_perf_lookup"),         m_PerfLookupMs,   m_PerfPeakLookupMs,   0.5, 3.0);
+            ImGui::EndTable();
+        }
 
         ImGui::Spacing();
-        ImGui::Text("  LookupPrice this frame: %d found, %d miss",
-            m_PerfLookupExact, m_PerfLookupMiss);
-        ImGui::Text("  Cached: %d inventories, %d items",
-            m_PerfCachedInvCount, m_PerfCachedItemCount);
+        Show(I18n::TrF("debug_lookup_counts",
+            { { "found", Num("%d", m_PerfLookupExact) }, { "missed", Num("%d", m_PerfLookupMiss) } }));
+        Show(I18n::TrF("debug_cached_counts",
+            { { "inventories", Num("%d", m_PerfCachedInvCount) }, { "items", Num("%d", m_PerfCachedItemCount) } }));
+        ImGui::Unindent();
 
-        if (ImGui::Button("Reset peaks")) {
+        if (ImGui::Button(I18n::TrId("debug_reset_peaks"))) {
             m_PerfPeakScanCallMs = m_PerfPeakGetAllMs = m_PerfPeakDrawInvMs = 0.0;
             m_PerfPeakGroundMs = m_PerfPeakLookupMs = 0.0;
         }
         ImGui::SameLine();
-        ImGui::TextDisabled("Worker-thread scan cost: app Debug -> DataVis -> Inventory Scan");
+        ImGui::TextDisabled("%s", I18n::Tr("debug_worker_cost_hint"));
 
         ImGui::Spacing();
         ImGui::Separator();
@@ -870,30 +937,36 @@ private:
         PluginSDK::Snapshot snap = ctx()->Game.GetSnapshot();
 
         // Price service status
+        using NinjaPricerText::YesNo;
+        const ImVec4 heading(0.6f, 0.8f, 1.0f, 1.0f);
         auto st = ctx()->Prices.GetStatus();
-        ImGui::TextColored(ImVec4(0.6f, 0.8f, 1.0f, 1.0f), "Price Service (host):");
-        ImGui::Text("  Loaded: %s", st.loaded ? "YES" : "NO");
-        ImGui::Text("  Total items: %d", st.totalItems);
-        ImGui::Text("  DivineInChaos: %.2f", st.divineInChaos);
-        ImGui::Text("  ExaltedInChaos: %.2f", st.exaltedInChaos);
-        ImGui::Text("  Categories: ok=%d / pending=%d / failed=%d",
-            st.catsOk, st.catsPending, st.catsFailed);
+        ImGui::TextColored(heading, "%s", I18n::Tr("debug_price_service"));
+        ImGui::Indent();
+        Show(I18n::TrF("debug_loaded", { { "value", YesNo(st.loaded) } }));
+        Show(I18n::TrF("debug_total_items", { { "count", Num("%d", st.totalItems) } }));
+        ImGui::Text("DivineInChaos: %.2f", st.divineInChaos);     // SDK field names
+        ImGui::Text("ExaltedInChaos: %.2f", st.exaltedInChaos);
+        Show(I18n::TrF("debug_categories", { { "ok", Num("%d", st.catsOk) },
+            { "pending", Num("%d", st.catsPending) }, { "failed", Num("%d", st.catsFailed) } }));
+        ImGui::Unindent();
 
         DrawPerfSection();
 
         ImGui::Separator();
 
-        ImGui::TextColored(ImVec4(0.6f, 0.8f, 1.0f, 1.0f), "Game State:");
-        ImGui::Text("  Attached: %s", snap.IsAttached ? "YES" : "NO");
-        ImGui::Text("  State: %d (InGame=4)", (int)snap.State);
-        ImGui::Text("  Area: %s (level %d)",
-            snap.CurrentAreaName.c_str(), snap.CurrentAreaLevel);
-        ImGui::Text("  IsHideout: %s, IsTown: %s",
-            snap.IsHideout ? "YES" : "NO", snap.IsTown ? "YES" : "NO");
+        ImGui::TextColored(heading, "%s", I18n::Tr("debug_game_state"));
+        ImGui::Indent();
+        Show(I18n::TrF("debug_attached", { { "value", YesNo(snap.IsAttached) } }));
+        Show(I18n::TrF("debug_state", { { "state", Num("%d", static_cast<int>(snap.State)) } }));
+        Show(I18n::TrF("debug_area", { { "area", snap.CurrentAreaName },
+            { "level", Num("%d", snap.CurrentAreaLevel) } }));
+        Show(I18n::TrF("debug_hideout_town", { { "hideout", YesNo(snap.IsHideout) },
+            { "town", YesNo(snap.IsTown) } }));
+        ImGui::Unindent();
 
         ImGui::Separator();
 
-        ImGui::TextColored(ImVec4(0.6f, 0.8f, 1.0f, 1.0f), "Ground Items (Entities):");
+        ImGui::TextColored(heading, "%s", I18n::Tr("debug_ground_items"));
         int totalEntities = (int)snap.Entities.size();
         int worldItems = 0;
         for (const auto& e : snap.Entities) {
@@ -901,36 +974,43 @@ private:
                 && e.EntitySubtype == PluginSDK::EntitySubtype::WorldItem)
                 worldItems++;
         }
-        ImGui::Text("  Total entities: %d", totalEntities);
-        ImGui::Text("  WorldItem entities: %d", worldItems);
-        ImGui::Text("  Name cache size: %d", (int)m_NameCache.size());
+        ImGui::Indent();
+        Show(I18n::TrF("debug_total_entities", { { "count", Num("%d", totalEntities) } }));
+        Show(I18n::TrF("debug_world_items", { { "count", Num("%d", worldItems) } }));
+        Show(I18n::TrF("debug_name_cache", { { "count", Num("%d", static_cast<int>(m_NameCache.size())) } }));
+        ImGui::Unindent();
 
-        if (worldItems > 0 && ImGui::TreeNode("WorldItem details (first 5)")) {
+        if (worldItems > 0 && ImGui::TreeNode(I18n::TrId("debug_world_item_details"))) {
             int count = 0;
             for (const auto& e : snap.Entities) {
                 if (e.EntityType != PluginSDK::EntityType::Item
                     || e.EntitySubtype != PluginSDK::EntitySubtype::WorldItem) continue;
                 if (count++ >= 5) break;
 
-                std::string name = GetGroundLookupName(e);
-                if (name.empty()) name = "(not read yet)";
+                const std::string name = GetGroundLookupName(e);
+                const PluginSDK::PriceResult price =
+                    name.empty() ? PluginSDK::PriceResult{} : CachedItemPrice(e.Address, name).price;
 
-                auto price = ctx()->Prices.LookupPrice(name);
-
-                ImGui::Text("  ID:%u Addr:0x%llX Valid:%d",
+                ImGui::Indent();
+                ImGui::Text("ID:%u Addr:0x%llX Valid:%d",
                     e.Id, (unsigned long long)e.Address, (int)e.IsValid);
-                ImGui::Text("    Name: '%s'", name.c_str());
-                ImGui::Text("    Pos: (%.0f, %.0f, %.0f) Zone:%d",
-                    e.WorldX, e.WorldY, e.WorldZ, (int)e.Zone);
+                ImGui::Indent();
+                Show(I18n::TrF("debug_item_name", { { "name",
+                    name.empty() ? std::string(I18n::Tr("debug_not_read_yet")) : name } }));
+                Show(I18n::TrF("debug_item_position", { { "x", Num("%.0f", e.WorldX) },
+                    { "y", Num("%.0f", e.WorldY) }, { "z", Num("%.0f", e.WorldZ) },
+                    { "zone", Num("%d", static_cast<int>(e.Zone)) } }));
                 float sx, sy;
                 bool vis = ctx()->Render.WorldToScreen(e.WorldX, e.WorldY, e.WorldZ, sx, sy);
-                ImGui::Text("    Screen: (%.0f, %.0f) Visible:%s",
-                    sx, sy, vis ? "YES" : "NO");
-                ImGui::Text("    Price found: %s%s", price.found ? "YES" : "NO",
-                    price.found
-                    ? (std::string(" -> ") + FormatPriceLocal(
-                        GetDisplayValue(price, m_DisplayCurrency), m_DisplayCurrency)).c_str()
-                    : "");
+                Show(I18n::TrF("debug_item_screen", { { "x", Num("%.0f", sx) }, { "y", Num("%.0f", sy) },
+                    { "visible", YesNo(vis) } }));
+                Show(I18n::TrF("debug_price_found", { { "value", YesNo(price.found) } }));
+                if (price.found) {
+                    ImGui::SameLine();
+                    Show("-> " + FormatPriceLocal(GetDisplayValue(price, m_DisplayCurrency), m_DisplayCurrency));
+                }
+                ImGui::Unindent();
+                ImGui::Unindent();
                 ImGui::Spacing();
             }
             ImGui::TreePop();
@@ -939,45 +1019,53 @@ private:
         ImGui::Separator();
 
         std::vector<PluginSDK::Inventory> invs = ctx()->Inventory.GetAll();
-        ImGui::TextColored(ImVec4(0.6f, 0.8f, 1.0f, 1.0f), "Inventory Data:");
-        ImGui::Text("  Inventories available: %d", (int)invs.size());
+        ImGui::TextColored(heading, "%s", I18n::Tr("debug_inventory_data"));
+        ImGui::Indent();
+        Show(I18n::TrF("debug_inventories_available", { { "count", Num("%d", static_cast<int>(invs.size())) } }));
+        ImGui::Unindent();
 
         for (const auto& inv : invs) {
             const char* invName = ctx()->Inventory.GetName(inv.InventoryId);
-            if (!invName) invName = "(unknown)";
+            if (!invName) invName = I18n::Tr("debug_unknown_inventory");
 
-            if (ImGui::TreeNode((void*)(intptr_t)inv.InventoryId,
-                "Inventory #%d '%s' (%dx%d, %d items)",
-                inv.InventoryId, invName, inv.TotalBoxesX, inv.TotalBoxesY,
-                (int)inv.Items.size()))
+            const std::string node = I18n::TrF("debug_inventory_node", {
+                { "id", Num("%d", inv.InventoryId) }, { "name", invName },
+                { "width", Num("%d", inv.TotalBoxesX) }, { "height", Num("%d", inv.TotalBoxesY) },
+                { "count", Num("%d", static_cast<int>(inv.Items.size())) } });
+            if (ImGui::TreeNode((void*)(intptr_t)inv.InventoryId, "%s", node.c_str()))
             {
-                ImGui::Text("  Grid: valid=%s pos=(%.0f, %.0f) cell=%.1f",
-                    inv.Grid.Valid ? "YES" : "NO",
-                    inv.Grid.GridScreenX, inv.Grid.GridScreenY, inv.Grid.CellSize);
+                ImGui::Indent();
+                Show(I18n::TrF("debug_grid", { { "valid", YesNo(inv.Grid.Valid) },
+                    { "x", Num("%.0f", inv.Grid.GridScreenX) }, { "y", Num("%.0f", inv.Grid.GridScreenY) },
+                    { "cell", Num("%.1f", inv.Grid.CellSize) } }));
 
                 int matchCount = 0;
                 for (const auto& item : inv.Items) {
                     std::string dn = GetItemLookupName(item);
-                    auto price = ctx()->Prices.LookupPrice(dn);
+                    auto price = CachedItemPrice(item.Address, dn).price;
                     if (price.found) matchCount++;
                 }
-                ImGui::Text("  Items with price match: %d / %d",
-                    matchCount, (int)inv.Items.size());
+                Show(I18n::TrF("debug_price_matches", { { "matched", Num("%d", matchCount) },
+                    { "total", Num("%d", static_cast<int>(inv.Items.size())) } }));
+                ImGui::Unindent();
 
-                if (ImGui::TreeNode("Item list (first 10)")) {
+                if (ImGui::TreeNode(I18n::TrId("debug_item_list"))) {
                     int count = 0;
                     for (const auto& item : inv.Items) {
                         if (count++ >= 10) break;
                         std::string dn = GetItemLookupName(item);
-                        auto price = ctx()->Prices.LookupPrice(dn);
+                        auto price = CachedItemPrice(item.Address, dn).price;
 
-                        ImGui::Text("  [%d,%d] Lookup:'%s' (stack:%d) path:'%s'",
-                            item.SlotX, item.SlotY, dn.c_str(),
-                            item.StackCount, item.Path.c_str());
-                        ImGui::Text("    Price: %s", price.found
-                            ? FormatPriceLocal(GetDisplayValue(price, m_DisplayCurrency),
-                                m_DisplayCurrency).c_str()
-                            : "NOT FOUND");
+                        ImGui::Indent();
+                        Show(I18n::TrF("debug_item_row", { { "x", Num("%d", item.SlotX) },
+                            { "y", Num("%d", item.SlotY) }, { "name", dn },
+                            { "stack", Num("%d", item.StackCount) }, { "path", item.Path } }));
+                        ImGui::Indent();
+                        Show(I18n::TrF("debug_item_price", { { "price", price.found
+                            ? FormatPriceLocal(GetDisplayValue(price, m_DisplayCurrency), m_DisplayCurrency)
+                            : std::string(I18n::Tr("debug_not_found")) } }));
+                        ImGui::Unindent();
+                        ImGui::Unindent();
                     }
                     ImGui::TreePop();
                 }
@@ -987,10 +1075,12 @@ private:
 
         ImGui::Separator();
 
-        ImGui::TextColored(ImVec4(0.6f, 0.8f, 1.0f, 1.0f), "Rendering:");
-        ImGui::Text("  IsOverlayMode: %s",
-            ctx()->Game.IsOverlayMode() ? "YES" : "NO");
-        ImGui::Text("  Screen: %dx%d", snap.ScreenWidth, snap.ScreenHeight);
+        ImGui::TextColored(heading, "%s", I18n::Tr("debug_rendering"));
+        ImGui::Indent();
+        ImGui::Text("IsOverlayMode: %s", YesNo(ctx()->Game.IsOverlayMode()));   // the SDK call's name
+        Show(I18n::TrF("debug_screen_size", { { "width", Num("%d", snap.ScreenWidth) },
+            { "height", Num("%d", snap.ScreenHeight) } }));
+        ImGui::Unindent();
     }
 
     // ========================================================================
@@ -1023,7 +1113,9 @@ private:
                 r.wx = e.WorldX; r.wy = e.WorldY; r.wz = e.WorldZ;
                 std::string name = GetGroundLookupName(e);
                 if (!name.empty()) {
-                    PluginSDK::PriceResult price = TimedLookup(name);
+                    // By the item's identity on a 371+ host (works in every game language).
+                    const ItemQuote quote = TimedItemLookup(e.Address, name);
+                    const PluginSDK::PriceResult& price = quote.price;
                     if (price.found) {
                         // Resolve the inner item once; reused for both rarity gate
                         // and stack multiplier so we never call GetWorldItemInner twice.
@@ -1041,7 +1133,7 @@ private:
                         }
                         if (ok) {
                             r.priceable = true;
-                            r.name = name;
+                            r.name = quote.IdentityName(name);   // the currency rule compares the English name
                             r.price = price;
                             r.stackMultiplier = 1;
                             if (inner && inner->Components.HasStack()) {
@@ -1144,7 +1236,9 @@ private:
             std::string displayName = GetItemLookupName(item);
             if (displayName.empty()) continue;
 
-            PluginSDK::PriceResult price = TimedLookup(displayName);
+            // By the item's identity on a 371+ host (works in every game language).
+            const ItemQuote quote = TimedItemLookup(item.Address, displayName);
+            const PluginSDK::PriceResult& price = quote.price;
             if (!price.found) continue;
 
             if (IsUniqueCategory(price.category) && item.Address) {
@@ -1165,7 +1259,7 @@ private:
 
             int multiplier = (item.StackCount > 1) ? item.StackCount : 1;
             float displayValue = GetDisplayValue(price, m_DisplayCurrency) * multiplier;
-            if (!ShouldShowPrice(displayName, displayValue)) continue;
+            if (!ShouldShowPrice(quote.IdentityName(displayName), displayValue)) continue;
 
             // Special stash tabs (currency/fragments/expedition/...) arrange their
             // cells freely, not on a uniform grid — the host resolves each item's
@@ -1592,18 +1686,46 @@ private:
         return r;
     }
 
-    // LookupPrice wrapper that accumulates per-frame timing + match-kind counts
-    // for the Debug perf panel. Routes through the cross-frame memo, so a cache
-    // hit costs ~0 and the panel's "LookupPrice/frame" reads near-zero once the
-    // cache is warm (the fix visible in situ). The found/miss counts still tick
-    // every frame, so "X found, Y miss" keeps reflecting items priced this frame.
-    PluginSDK::PriceResult TimedLookup(const std::string& name) {
+    // An item's price and the English name it was priced by ("" when priced by the shown name).
+    struct ItemQuote {
+        PluginSDK::PriceResult price;
+        std::string english;
+        // The name the price rules compare (the selected currency is never priced on itself).
+        std::string IdentityName(const std::string& shown) const { return english.empty() ? shown : english; }
+    };
+
+    // The price of an item (an inventory item, or a WorldItem entity on the ground) by its
+    // identity (desktop 371+: the host prices its unique, unidentified-unique art or base type by
+    // the English name, so every game language gets the English item's price); else by `name`,
+    // the name the game shows: an older host, no address, or an item the host could not read.
+    // A known item without a price is never priced by its shown name. Memoized per (address,
+    // name) beside CachedLookupPrice and cleared with it; render thread only.
+    ItemQuote CachedItemPrice(uintptr_t address, const std::string& name) {
+        if (!address || !ctx()->Prices.CanLookupByItem()) return { CachedLookupPrice(name), {} };
+        std::string key = std::to_string(address);
+        key += '\n';
+        key += name;
+        auto it = m_ItemPriceCache.find(key);
+        if (it != m_ItemPriceCache.end()) return it->second;
+        ItemQuote q;
+        q.price = ctx()->Prices.LookupPriceByItem(address, &q.english);
+        if (q.english.empty()) q.price = CachedLookupPrice(name);   // the item could not be read
+        if (m_ItemPriceCache.size() >= 4096) m_ItemPriceCache.clear();
+        m_ItemPriceCache.emplace(std::move(key), q);
+        return q;
+    }
+
+    // CachedItemPrice with the per-frame timing + match-kind counts of the Debug perf panel.
+    // Routes through the cross-frame memo, so a cache hit costs ~0 and the panel's
+    // "LookupPrice/frame" reads near-zero once the cache is warm. The found/miss counts still
+    // tick every frame, so "X found, Y miss" keeps reflecting items priced this frame.
+    ItemQuote TimedItemLookup(uintptr_t address, const std::string& name) {
         double t0 = PerfNowMs();
-        PluginSDK::PriceResult r = CachedLookupPrice(name);
+        ItemQuote q = CachedItemPrice(address, name);
         m_PerfLookupMs += (PerfNowMs() - t0);
-        if (r.found) ++m_PerfLookupExact;
-        else         ++m_PerfLookupMiss;
-        return r;
+        if (q.price.found) ++m_PerfLookupExact;
+        else               ++m_PerfLookupMiss;
+        return q;
     }
 
     // ========================================================================
@@ -1622,35 +1744,31 @@ private:
         return ctx()->Ui.GetStringId(elemAddr);
     }
 
-    // Parse a reward label "Nx ItemName" -> {qty, name}; no "Nx " prefix -> {1, label}.
-    // Returns false for labels we never price: the panel title, the unused tab
-    // placeholders, and skill rewards.
-    static bool ParseReward(const std::string& label, int& outQty, std::string& outName) {
-        if (label.empty()) return false;
-        if (label == "Runeshape Combinations") return false;
-        if (label.rfind("[dnt-", 0) == 0) return false;   // "[dnt-unused] tab one/two"
-        if (label.rfind("Skill:", 0) == 0) return false;   // skill rewards: not tradeable
+    // The panel's title and reward-label template in the game language (ctx()->Lang.GameString,
+    // desktop 371+), then the English ones (RuneshapeLabel.h). Asked again when the game language
+    // changes and every 2 s (the host may install its game texts after the first ask).
+    void RefreshRuneshapeTexts() {
+        const auto now = std::chrono::steady_clock::now();
+        const uint64_t languageRevision = ctx()->Lang.GameLanguage().revision;
+        if (!m_RsTitles.empty() && languageRevision == m_RsTextsLanguage &&
+            now - m_RsTextsAt < std::chrono::seconds(2)) return;
+        m_RsTextsAt = now;
+        m_RsTextsLanguage = languageRevision;
+        const std::string title = ctx()->Lang.GameString(std::string(NinjaRuneshape::kTitleId).c_str());
+        const std::string label = ctx()->Lang.GameString(std::string(NinjaRuneshape::kLabelId).c_str());
+        m_RsTitles = NinjaRuneshape::Candidates(title, NinjaRuneshape::kEnglishTitle);
+        m_RsTemplates = NinjaRuneshape::Candidates(label, NinjaRuneshape::kEnglishTemplate);
+    }
 
-        int qty = 0;
-        size_t i = 0;
-        while (i < label.size() && label[i] >= '0' && label[i] <= '9') {
-            qty = qty * 10 + (label[i] - '0');
-            i++;
-        }
-        if (i > 0 && i + 1 < label.size() && label[i] == 'x' && label[i + 1] == ' ') {
-            outQty = (qty < 1) ? 1 : qty;
-            outName = label.substr(i + 2);   // strip the "Nx " quantity prefix
-        } else {
-            outQty = 1;
-            outName = label;
-        }
-        if (outName.empty()) return false;
-
-        // Keep generic unique-class rewards in the lookup path. The central price
-        // matcher rejects automatic aliases for unspecified categories, while an
-        // explicit custom price remains a valid user override.
-
-        return true;
+    // Parse a reward label ("3x Orb of Augmentation", "Сфера усиления (3)", ...) -> {qty, name};
+    // a label no template reads -> {1, label}. Returns false for labels we never price: the panel
+    // title, the unused tab placeholders, and skill rewards. Generic unique-class rewards stay in
+    // the lookup path: the central price matcher rejects automatic aliases for unspecified
+    // categories, while an explicit custom price remains a valid user override.
+    // The panel texts are the ones RefreshRuneshapeTexts last read (the discovery and each scan
+    // refresh them first).
+    bool ParseReward(const std::string& label, int& outQty, std::string& outName) const {
+        return NinjaRuneshape::ParseReward(label, m_RsTitles, m_RsTemplates, outQty, outName);
     }
 
     // Return a recipe row's reward-label element: the first child that carries a
@@ -1695,9 +1813,9 @@ private:
         return n;
     }
 
-    // Bounded BFS for the element whose StringId == target. When visibleOnly,
-    // only descend into visible nodes (cheap while the panel is open).
-    uintptr_t BfsFindStringId(uintptr_t root, const char* target,
+    // Bounded BFS for the element whose StringId is one of `targets` (UTF-8, trimmed). When
+    // visibleOnly, only descend into visible nodes (cheap while the panel is open).
+    uintptr_t BfsFindStringId(uintptr_t root, const std::vector<std::string>& targets,
                               bool visibleOnly, int budget) {
         if (!root) return 0;
         std::vector<uintptr_t> q;
@@ -1712,7 +1830,7 @@ private:
             seen.insert(node);
             n++;
             std::string id = ReadUiStringId(node);
-            if (!id.empty() && id == target) return node;
+            if (!id.empty() && NinjaRuneshape::TitleMatches(id, targets)) return node;
             if (node == root || !visibleOnly || ctx()->Ui.IsVisible(node)) {
                 for (uintptr_t c : ctx()->Ui.GetChildren(node))
                     if (c && !seen.count(c)) q.push_back(c);
@@ -1788,7 +1906,9 @@ private:
 
         // Title is the stable anchor; visible-pruned BFS reaches it only while the
         // panel is open (its ancestor chain is visible then) — also keeps it cheap.
-        uintptr_t title = BfsFindStringId(urs, "Runeshape Combinations", true, 40000);
+        // The title in the game language and the English one (one walk).
+        RefreshRuneshapeTexts();
+        uintptr_t title = BfsFindStringId(urs, m_RsTitles, true, 40000);
         if (!title) return 0;
 
         // Walk up to the panel's top-level window (the direct child of urs). Its own
@@ -1879,7 +1999,7 @@ private:
         // m_ShowRuneshapeWindow: re-enable via the "Runeshape window" checkbox.
         PluginSDK::InfoWindowOptions o;
         o.id = "runeshape";
-        o.title = "Runeshape";
+        o.title = I18n::Tr("rswin_title");
         o.flags = flags;
         o.defaultPos = ImVec2(100.0f, 100.0f);
         o.legacyPos = ImVec2(m_RuneshapeWinX, m_RuneshapeWinY);
@@ -1915,7 +2035,7 @@ private:
                           : (m_CachedExaltedInChaos > 0.0f ? m_CachedExaltedInChaos : 0.0f);
 
         if (rs.empty()) {
-            ImGui::TextDisabled("No Runeshapes");
+            ImGui::TextDisabled("%s", I18n::Tr("rswin_none"));
         } else {
             float baseFontSize = ImGui::GetFontSize() * m_TextScale;
             const float kSquareSz = baseFontSize * 1.1f;   // small colored square
@@ -2198,7 +2318,7 @@ private:
                                      (rw.comboWeight > 0) ? "+%d" : "%d", rw.comboWeight);
                             ImGui::TextColored(wc, "%s", wbuf);
                             if (ImGui::IsItemHovered())
-                                ImGui::SetTooltip("Total rune weight of this combination");
+                                ImGui::SetTooltip("%s", I18n::Tr("rswin_weight_tooltip"));
                             lineStarted = true;
                         }
 
@@ -2241,7 +2361,7 @@ private:
                                 : ImVec4(1.0f, 0.82f, 0.27f, 1.0f);  // gold
                             ImGui::TextColored(rcol, "%s", rw.propagatingRunes.c_str());
                             if (ImGui::IsItemHovered())
-                                ImGui::SetTooltip("Propagating rune - carries over to the next remnant");
+                                ImGui::SetTooltip("%s", I18n::Tr("rswin_propagating_tooltip"));
                         }
                     }
                     ImGui::Unindent(kSquareSz + 4.0f);
@@ -2270,24 +2390,20 @@ private:
         // Panel-open gate: the runeshape window's own visible bit clears when the
         // panel is closed, even though the cached subtree (and row bits) persist.
         if (m_RuneshapeWindowAddr && !ctx()->Ui.IsVisible(m_RuneshapeWindowAddr)) return;
+        RefreshRuneshapeTexts();   // the label templates of the game language (ParseReward)
 
-        // (name-lower, qty, size) -> combo weights across all resolved stations
-        // (SDK). A row gets a weight only when its match is UNAMBIGUOUS: one
-        // distinct weight among the candidates that share the reward name, the
-        // quantity and (when countable) the symbol/recipe size — the panel rows
-        // carry rune symbols, not rune ids, so composition can't be read back.
-        auto toLowerAscii = [](std::string s) {
-            for (auto& ch : s) if (ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch + 32);
-            return s;
-        };
-        std::unordered_map<std::string, std::vector<std::array<int, 3>>> weightIdx;
-        if (m_ShowRuneshapeWeights) {
-            for (const auto& st : ctx()->Runeshape.Runeshapes()) {
-                for (const auto& rw : ctx()->Runeshape.Rewards(st.entityId)) {
-                    if (rw.name.empty()) continue;
-                    weightIdx[toLowerAscii(rw.name)].push_back(
-                        { rw.count, rw.recipeSize, rw.comboWeight });
-                }
+        // The rewards of every resolved station (SDK), by the host's English names. A row gets
+        // a weight only when its match is UNAMBIGUOUS: one distinct weight among the rewards
+        // that share the row's name, quantity and (when countable) symbol/recipe size — the
+        // panel rows carry rune symbols, not rune ids, so composition can't be read back. A
+        // row in another game language is matched by quantity, size and its own price
+        // (NinjaRuneshape::RewardIndex::Match), which also names its English reward for the
+        // currency rule below.
+        NinjaRuneshape::RewardIndex rewards;
+        for (const auto& st : ctx()->Runeshape.Runeshapes()) {
+            for (const auto& rw : ctx()->Runeshape.Rewards(st.entityId)) {
+                if (rw.name.empty()) continue;
+                rewards.Add({ rw.name, rw.count, rw.recipeSize, rw.comboWeight, rw.priced, rw.unitChaos });
             }
         }
 
@@ -2310,32 +2426,26 @@ private:
             rr.rowAddr = row;
             rr.labelAddr = label;
 
-            if (m_ShowRuneshapePrices) {
-                PluginSDK::PriceResult price = CachedLookupPrice(name);
-                if (price.found) {
-                    float total = GetDisplayValue(price, m_DisplayCurrency) * qty;
-                    if (ShouldShowPrice(name, total)) {
-                        rr.total = total;
-                        rr.chaos = price.chaos * qty;
-                        rr.iconPath = price.iconPath;
-                    }
+            // The row's price (the host prices a localized base-type name too) and the reward it
+            // stands for among the stations' rewards: its weight and English name.
+            const PluginSDK::PriceResult price = CachedLookupPrice(name);
+            const NinjaRuneshape::RowMatch match = rewards.Empty()
+                ? NinjaRuneshape::RowMatch{}
+                : rewards.Match(name, qty, CountRowSymbols(row), price.found, price.chaos);
+
+            if (m_ShowRuneshapePrices && price.found) {
+                float total = GetDisplayValue(price, m_DisplayCurrency) * qty;
+                // The currency rule compares the English name, as the item path does.
+                if (ShouldShowPrice(match.english.empty() ? name : match.english, total)) {
+                    rr.total = total;
+                    rr.chaos = price.chaos * qty;
+                    rr.iconPath = price.iconPath;
                 }
             }
 
-            if (m_ShowRuneshapeWeights && !weightIdx.empty()) {
-                auto it = weightIdx.find(toLowerAscii(name));
-                if (it != weightIdx.end()) {
-                    const int symCount = CountRowSymbols(row);
-                    bool have = false, ambiguous = false;
-                    int  wval = 0;
-                    for (const auto& cand : it->second) {
-                        if (cand[0] != qty) continue;
-                        if (symCount > 0 && cand[1] > 0 && cand[1] != symCount) continue;
-                        if (!have)                 { have = true; wval = cand[2]; }
-                        else if (cand[2] != wval)  { ambiguous = true; break; }
-                    }
-                    if (have && !ambiguous) { rr.hasWeight = true; rr.weight = wval; }
-                }
+            if (m_ShowRuneshapeWeights && match.hasWeight) {
+                rr.hasWeight = true;
+                rr.weight = match.weight;
             }
 
             // Keep the row only when it has something to draw.
@@ -2603,8 +2713,13 @@ private:
     // plugin. Memoizing by display name collapses the per-frame cost to O(items)
     // hash lookups. Cleared on area change and when the host DB refreshes (rate
     // shift or revision) or on a 30 s safety interval for older hosts.
-    // See CachedLookupPrice / TimedLookup.
+    // See CachedLookupPrice / CachedItemPrice / TimedItemLookup.
     std::unordered_map<std::string, PluginSDK::PriceResult> m_PriceCache;
+    std::unordered_map<std::string, ItemQuote> m_ItemPriceCache;   // CachedItemPrice: "<address>\n<name>" -> quote
+    // Runeshape panel texts (RefreshRuneshapeTexts): title and label template candidates.
+    std::vector<std::string> m_RsTitles, m_RsTemplates;
+    std::chrono::steady_clock::time_point m_RsTextsAt{};
+    uint64_t m_RsTextsLanguage = 0;
     uint64_t m_PriceRevisionSeen = 0;
     float m_PriceCacheDivineSeen  = 0.0f;
     float m_PriceCacheExaltedSeen = 0.0f;
@@ -2733,6 +2848,6 @@ extern "C" PLUGIN_API void DestroyPlugin(PluginSDK::Plugin* plugin) {
 POEFIXER_PLUGIN_INFO(
     "NinjaPricer",
     "Ninja Pricer",
-    "1.0.2",
+    "1.0.3",
     "POEFixer",
     "Shows item prices on dropped items, in your inventory and stash, in the Ritual shop and on Runeshape rewards.")
