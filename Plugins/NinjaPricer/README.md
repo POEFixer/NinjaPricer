@@ -32,7 +32,8 @@ exchange rates.
   inventory/stash, minimum prices, inventory scan interval.
 - **Overlay Toggles** — dropped items, inventory, stash, Ritual, Runeshape (and its window
   options), item icons, colour square, hide when the game is not focused, and a
-  hold-to-hide hotkey (any key or mouse button).
+  hold hotkey (any key, or the right, middle, 4th or 5th mouse button) that either hides
+  the prices and the Runeshape window while held or shows them only while held.
 - **Runeshape weights** — show or hide weights in both the game's Combinations panel
   and the movable Runeshape window. **Radar -> RuneShape -> Show weights on map**
   controls map labels separately; edit the rune weights in that Radar tab.

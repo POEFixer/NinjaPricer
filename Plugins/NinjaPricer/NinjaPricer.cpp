@@ -13,6 +13,7 @@
 #include "../../POEFixer/plugin_sdk/PluginSDK.h"
 #include "lang_en.generated.h"   // the embedded English: once per DLL, after PluginSDK.h
 #include "../../POEFixer/plugin_sdk/PluginInfoWindow.h"
+#include "../../POEFixer/plugin_sdk/PluginUi.h"   // the kit's look for the hotkey rows
 #include "../../POEFixer/imgui/imgui.h"
 #include <d3d11.h>
 #include <sal.h>
@@ -143,6 +144,12 @@ enum class DisplayCurrency : int {
     Chaos   = 2,
 };
 
+// What holding the hold hotkey does to everything the plugin draws.
+enum class HoldKeyMode : int {
+    HideWhileHeld = 0,   // drawn as usual, gone while the key is held (default)
+    ShowWhileHeld = 1,   // hidden, drawn only while the key is held
+};
+
 static constexpr const char* kMinimumPriceKeys[] = { "divine", "exalted", "chaos" };
 static constexpr const char* kMinimumPriceLabelKeys[] = {
     I18n::Key("display_minimum_divine"), I18n::Key("display_minimum_exalted"),
@@ -252,6 +259,10 @@ namespace NinjaPricerHotkeys {
 
 using KeyState = std::array<bool, 256>;
 
+// Capture() results besides a virtual-key code to bind.
+inline constexpr int kWaiting = 0;
+inline constexpr int kCancel = -1;
+
 // Capture starts from a mouse click on the settings button.  Remember every key that is
 // already down so that the activation click (including a right-click on an overlay host)
 // cannot become the newly assigned hotkey.  It becomes eligible after it is released and
@@ -260,6 +271,99 @@ inline void Arm(KeyState& ignoredDown, const KeyState& down) {
     ignoredDown = down;
 }
 
+// ---- Key names: never the key code (the code tells the user nothing) ----
+//
+// Keyboard keys carry the kit's English names (PluginUi::KeyName, as in every plugin), mouse
+// buttons and "None" the kit's texts in the program language. The punctuation keys print a
+// character of the keyboard layout (VK_OEM_1 is ";" in US, "Ü" in German, "Ж" in Russian):
+// those show that character. Windows' own key names are not used: GetKeyNameTextW names the
+// arrows, Insert, Delete, Home, End and Page Up / Down after the numpad keys ("Num 8"), Num
+// Lock "Pause" and the media keys by a letter. A key without a name is never bound.
+
+// The punctuation keys whose character depends on the keyboard layout (VK_OEM_1..VK_OEM_8,
+// VK_OEM_PLUS / COMMA / MINUS / PERIOD, VK_OEM_102, the Brazilian ABNT keys, 0xE1).
+inline bool IsLayoutCharKey(int vk) {
+    return (vk >= 0xBA && vk <= 0xC2) || (vk >= 0xDB && vk <= 0xDF) || vk == 0xE1 || vk == 0xE2;
+}
+
+// The character the keyboard layout of the window in front puts on a punctuation key
+// (upper-cased, UTF-8); "" when it puts none.
+inline std::string LayoutCharName(int vk) {
+    if (!IsLayoutCharKey(vk)) return {};
+    const HWND front = GetForegroundWindow();
+    const HKL layout = GetKeyboardLayout(front ? GetWindowThreadProcessId(front, nullptr) : 0);
+    // The top bit marks a dead key (a diacritic such as ^ or ´): its character still names it.
+    wchar_t ch = static_cast<wchar_t>(MapVirtualKeyExW(static_cast<UINT>(vk), MAPVK_VK_TO_CHAR, layout) & 0x7FFFFFFF);
+    if (ch <= 0x20 || ch == 0x7F) return {};
+    CharUpperBuffW(&ch, 1);
+    char utf8[8] = {};
+    const int n = WideCharToMultiByte(CP_UTF8, 0, &ch, 1, utf8, sizeof(utf8) - 1, nullptr, nullptr);
+    return n > 0 ? std::string(utf8, static_cast<size_t>(n)) : std::string();
+}
+
+// The kit names this code itself: its key table, the mouse buttons, the side-specific modifiers.
+inline bool KitNames(int vk) {
+    switch (vk) {
+    case 0x01: case 0x02: case 0x04: case 0x05: case 0x06:
+    case 0xA0: case 0xA1: case 0xA2: case 0xA3: case 0xA4: case 0xA5:
+        return true;
+    default: break;
+    }
+    int count = 0;
+    const PluginUi::detail::KeyRow* rows = PluginUi::detail::KeyTable(count);
+    for (int i = 0; i < count; ++i)
+        if (rows[i].vk == vk) return true;
+    return false;
+}
+
+// The media, browser and Japanese / Korean input keys the kit's table lacks.
+inline const char* ExtraKeyName(int vk) {
+    switch (vk) {
+    case VK_CLEAR: return "Clear";   // Num 5 with Num Lock off
+    case 0x15: return "Kana/Hangul";   // VK_KANA / VK_HANGUL
+    case 0x19: return "Kanji/Hanja";   // VK_KANJI / VK_HANJA
+    case VK_CONVERT: return "Convert";
+    case VK_NONCONVERT: return "Non-convert";
+    case 0xF2: return "Katakana/Hiragana";   // VK_OEM_COPY on a Japanese keyboard
+    case 0xF3: case 0xF4: return "Hankaku/Zenkaku";   // VK_OEM_AUTO / VK_OEM_ENLW
+    case VK_SLEEP: return "Sleep";
+    case VK_LAUNCH_MAIL: return "Mail";
+    case VK_LAUNCH_MEDIA_SELECT: return "Media";
+    case VK_LAUNCH_APP1: return "Launch App 1";
+    case VK_LAUNCH_APP2: return "Launch App 2";
+    case VK_VOLUME_MUTE: return "Volume Mute";
+    case VK_VOLUME_DOWN: return "Volume Down";
+    case VK_VOLUME_UP: return "Volume Up";
+    case VK_MEDIA_NEXT_TRACK: return "Next Track";
+    case VK_MEDIA_PREV_TRACK: return "Previous Track";
+    case VK_MEDIA_STOP: return "Stop";
+    case VK_MEDIA_PLAY_PAUSE: return "Play/Pause";
+    case VK_BROWSER_REFRESH: return "Browser Refresh";
+    case VK_BROWSER_STOP: return "Browser Stop";
+    case VK_BROWSER_SEARCH: return "Browser Search";
+    case VK_BROWSER_FAVORITES: return "Browser Favorites";
+    case VK_BROWSER_HOME: return "Browser Home";
+    default: return nullptr;
+    }
+}
+
+// The plugin can name this key (and so may bind it).
+inline bool HasKeyName(int vk) {
+    return !LayoutCharName(vk).empty() || ExtraKeyName(vk) != nullptr || KitNames(vk);
+}
+
+// The bound key's name. Only a code an older version bound and nothing names any more falls
+// back to the kit's "Key {code}".
+inline std::string KeyName(int vk) {
+    if (std::string ch = LayoutCharName(vk); !ch.empty()) return ch;
+    if (const char* extra = ExtraKeyName(vk)) return extra;
+    return PluginUi::KeyName(vk);
+}
+
+// Esc cancels.  Any other fresh key the plugin can name, or mouse button (right, middle, 4,
+// 5), is the binding; a key without a name is ignored (the row keeps waiting, as the kit's
+// HotkeyCapture ignores keys outside its table).  The left button never is: it clicks the
+// settings (a left click elsewhere cancels, the caller sees it through ImGui as the kit does).
 inline int Capture(const KeyState& down, KeyState& ignoredDown) {
     for (size_t i = 0; i < ignoredDown.size(); ++i) {
         if (ignoredDown[i] && !down[i]) ignoredDown[i] = false;
@@ -269,44 +373,74 @@ inline int Capture(const KeyState& down, KeyState& ignoredDown) {
         return vk >= 0 && vk < static_cast<int>(down.size()) &&
                down[static_cast<size_t>(vk)] && !ignoredDown[static_cast<size_t>(vk)];
     };
-    if (pressed(VK_ESCAPE)) return VK_ESCAPE;
+    if (pressed(VK_ESCAPE)) return kCancel;
 
     // Mouse buttons are valid virtual-key hotkeys too.  They are checked explicitly
     // because the ordinary keyboard scan starts at VK_BACK (0x08).
-    for (const int vk : { VK_LBUTTON, VK_RBUTTON, VK_MBUTTON, VK_XBUTTON1, VK_XBUTTON2 }) {
+    for (const int vk : { VK_RBUTTON, VK_MBUTTON, VK_XBUTTON1, VK_XBUTTON2 }) {
         if (pressed(vk)) return vk;
     }
     for (int vk = 0x08; vk < 0xFF; ++vk) {
-        if (pressed(vk)) return vk;
+        if (pressed(vk) && HasKeyName(vk)) return vk;
     }
-    return 0;
+    return kWaiting;
+}
+
+// Every key's state now, as the plugin reads its hotkeys in the game.
+inline KeyState ReadKeyState() {
+    KeyState down{};
+    for (int vk = 0; vk < static_cast<int>(down.size()); ++vk)
+        down[static_cast<size_t>(vk)] = (GetAsyncKeyState(vk) & 0x8000) != 0;
+    return down;
 }
 
 } // namespace NinjaPricerHotkeys
 
-// Virtual key name helper. The key's own name comes from Windows in the system's
-// language: read it wide and pass it on as UTF-8 (the ANSI name of a Russian or
-// Chinese keyboard layout is no UTF-8).
-static std::string GetVkName(int vk) {
-    if (vk == 0) return I18n::Tr("hotkey_none");
-    switch (vk) {
-    case VK_LBUTTON: return I18n::Tr("hotkey_mouse_left");
-    case VK_RBUTTON: return I18n::Tr("hotkey_mouse_right");
-    case VK_MBUTTON: return I18n::Tr("hotkey_mouse_middle");
-    case VK_XBUTTON1: return I18n::Tr("hotkey_mouse_4");
-    case VK_XBUTTON2: return I18n::Tr("hotkey_mouse_5");
-    default: break;
-    }
-    const std::string code = Num("0x%02X", vk);
-    const UINT scanCode = MapVirtualKeyW(static_cast<UINT>(vk), MAPVK_VK_TO_VSC);
-    wchar_t wideName[64] = {};
-    if (GetKeyNameTextW(static_cast<LONG>(scanCode) << 16, wideName, 64) > 0) {
-        char keyName[256] = {};
-        if (WideCharToMultiByte(CP_UTF8, 0, wideName, -1, keyName, sizeof(keyName), nullptr, nullptr) > 0)
-            return std::string(keyName) + " (" + code + ")";
-    }
-    return I18n::TrF("hotkey_key_code", { { "code", code } });
+namespace NinjaPricerUi {
+
+// Width of a radio button with this label ("###id" excluded).
+inline float RadioWidth(const char* label) {
+    return ImGui::GetFrameHeight() + ImGui::GetStyle().ItemInnerSpacing.x + ImGui::CalcTextSize(label, nullptr, true).x;
 }
+
+// The narrowest hotkey row: the key button at its 7 em minimum and Clear beside it.
+inline float HotkeyButtonsMinWidth() {
+    return ImGui::GetFontSize() * 7.0f + ImGui::GetStyle().ItemSpacing.x +
+           PluginUi::ButtonWidth(PluginSDK::I18n::KitText("plugin_kit_clear", "Clear"));
+}
+
+// A block of label-left rows on one measured column (PluginUi::LabelColumn) while the tab has
+// room for the column plus the rows' narrowest controls; otherwise each label on its own line
+// with its controls indented under it, so a narrow tab, a large font or a long translation
+// never pushes a control past the tab's edge. Build it where the block starts, every frame.
+class LabelRows {
+public:
+    LabelRows(std::initializer_list<const char*> labels, float narrowestControls)
+        : m_Column(labels), m_X0(ImGui::GetCursorPosX()),
+          m_Stacked(ImGui::GetContentRegionAvail().x < m_Column.Width() + narrowestControls) {}
+
+    // Draws the label and leaves the cursor where the row's controls start.
+    void Row(const char* label) const {
+        if (!m_Stacked) {
+            m_Column.RowNoWidth(label);
+            return;
+        }
+        ImGui::SetCursorPosX(m_X0);
+        ImGui::TextUnformatted(label ? label : "");
+        ImGui::SetCursorPosX(ControlsX());
+    }
+    // Where a row's controls start, also for a control wrapped onto a line of its own.
+    float ControlsX() const {
+        return m_Stacked ? m_X0 + ImGui::GetStyle().IndentSpacing : m_X0 + m_Column.Width();
+    }
+
+private:
+    PluginUi::LabelColumn m_Column;
+    float m_X0;
+    bool m_Stacked;
+};
+
+} // namespace NinjaPricerUi
 
 class NinjaPricerPlugin : public PluginSDK::Plugin {
 public:
@@ -459,54 +593,127 @@ public:
         m_GroundPricePosition = static_cast<GroundPricePosition>(gndPos);
     }
 
-    // Hotkey capture row: "<label>  <binding>  [Set Hotkey] [Clear]". While this
-    // row is capturing (m_CaptureTarget == &vk) the next pressed key is bound;
-    // ESC cancels. One capture at a time across all rows by construction.
-    // Returns true when a key was bound THIS frame — the key is physically down
-    // at that moment, so callers can re-arm edge detectors against it.
+    // A hotkey in the kit's look and behaviour (PluginUi::HotkeyCapture): the bound key's
+    // name on a quiet button; click it, then press a key or a mouse button (right, middle,
+    // 4, 5); while it waits it is the theme's filled button saying so, and Esc or a left
+    // click elsewhere cancels. A quiet Clear beside it, dimmed while nothing is bound. The
+    // key is read with GetAsyncKeyState (NinjaPricerHotkeys::Capture), as the plugin reads
+    // its hotkeys in the game. One capture at a time across all rows (m_CaptureTarget ==
+    // &vk). Returns true when a key was bound THIS frame: the key is physically down at
+    // that moment, so callers can re-arm edge detectors against it.
     void BeginHotkeyCapture(int* target) {
-        NinjaPricerHotkeys::KeyState down{};
-        for (int vk = 0; vk < static_cast<int>(down.size()); ++vk)
-            down[static_cast<size_t>(vk)] = (GetAsyncKeyState(vk) & 0x8000) != 0;
-        NinjaPricerHotkeys::Arm(m_CaptureIgnoredDown, down);
+        NinjaPricerHotkeys::Arm(m_CaptureIgnoredDown, NinjaPricerHotkeys::ReadKeyState());
         m_CaptureTarget = target;
     }
 
-    bool DrawHotkeyCaptureRow(const char* label, const char* idSuffix, int& vk) {
+    void EndHotkeyCapture() {
+        m_CaptureTarget = nullptr;
+        m_CaptureIgnoredDown.fill(false);
+    }
+
+    bool DrawHotkeyButton(const char* idSuffix, int& vk, const char* tip) {
+        using PluginSDK::I18n::KitText;
         bool boundNow = false;
-        ImGui::TextUnformatted(label);
+        const bool waiting = m_CaptureTarget == &vk;
+
+        // The ids stay "###hotkey_set_<row>" / "###hotkey_clear_<row>" in every language.
+        const std::string text = waiting ? std::string(KitText("plugin_kit_press_key", "Press a key... (Esc cancels)"))
+                                         : NinjaPricerHotkeys::KeyName(vk);
+        const std::string clearLabel =
+            std::string(KitText("plugin_kit_clear", "Clear")) + "###hotkey_clear_" + idSuffix;
+
+        // As wide as its text and at least 7 em (the kit's width), but never past the end of
+        // the row with Clear beside it: a text that does not fit (the waiting text of a long
+        // language in a narrow tab) ends in "...".
+        const ImGuiStyle& style = ImGui::GetStyle();
+        const float textWidth = ImGui::CalcTextSize(text.c_str()).x + style.FramePadding.x * 2.0f;
+        const float room = ImGui::GetContentRegionAvail().x - style.ItemSpacing.x - PluginUi::ButtonWidth(clearLabel.c_str());
+        const float width = (std::max)(ImGui::GetFontSize() * 7.0f, (std::min)(textWidth, room));
+        const bool fits = textWidth <= width;
+        const std::string label = (fits ? text : std::string()) + "###hotkey_set_" + idSuffix;
+
+        // Idle it reads like a field (quiet surface); waiting it takes the theme's filled
+        // button colour so the capture state is obvious. Clicking it while it waits keeps
+        // it waiting.
+        const bool clicked = waiting ? ImGui::Button(label.c_str(), ImVec2(width, 0.0f))
+                                     : PluginUi::SubtleButton(label.c_str(), ImVec2(width, 0.0f));
+        const bool hovered = ImGui::IsItemHovered();
+        if (!fits) {
+            const ImVec2 min = ImGui::GetItemRectMin();
+            const ImVec2 max = ImGui::GetItemRectMax();
+            ImGui::RenderTextEllipsis(ImGui::GetWindowDrawList(),
+                                      ImVec2(min.x + style.FramePadding.x, min.y + style.FramePadding.y),
+                                      ImVec2(max.x - style.FramePadding.x, max.y), max.x - style.FramePadding.x,
+                                      text.c_str(), nullptr, nullptr);
+        }
+        PluginUi::Tip(tip);
+
+        if (clicked && !waiting) {
+            BeginHotkeyCapture(&vk);
+        } else if (waiting) {
+            if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !hovered) {
+                EndHotkeyCapture();   // clicked away (Clear, another row, anywhere)
+            } else {
+                const int captured =
+                    NinjaPricerHotkeys::Capture(NinjaPricerHotkeys::ReadKeyState(), m_CaptureIgnoredDown);
+                if (captured == NinjaPricerHotkeys::kCancel) {
+                    EndHotkeyCapture();
+                } else if (captured != NinjaPricerHotkeys::kWaiting) {
+                    vk = captured;
+                    EndHotkeyCapture();
+                    boundNow = true;
+                }
+            }
+        }
+
         ImGui::SameLine();
-        if (m_CaptureTarget == &vk) {
-            ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, 1.0f), "%s", I18n::Tr("hotkey_press_any_key"));
-            NinjaPricerHotkeys::KeyState down{};
-            for (int key = 0; key < static_cast<int>(down.size()); ++key)
-                down[static_cast<size_t>(key)] = (GetAsyncKeyState(key) & 0x8000) != 0;
-            const int captured = NinjaPricerHotkeys::Capture(down, m_CaptureIgnoredDown);
-            if (captured == VK_ESCAPE) {
-                m_CaptureTarget = nullptr;
-                m_CaptureIgnoredDown.fill(false);
-            } else if (captured != 0) {
-                vk = captured;
-                m_CaptureTarget = nullptr;
-                m_CaptureIgnoredDown.fill(false);
-                boundNow = true;
-            }
+        ImGui::BeginDisabled(vk == 0 && !waiting);
+        if (PluginUi::SubtleButton(clearLabel.c_str())) {
+            if (m_CaptureTarget == &vk) EndHotkeyCapture();
+            vk = 0;
         }
-        else {
-            Show(GetVkName(vk));
-            ImGui::SameLine();
-            // The ids stay "###hotkey_set_<row>" / "###hotkey_clear_<row>" in every language.
-            const std::string setLabel = std::string(I18n::Tr("hotkey_set")) + "###hotkey_set_" + idSuffix;
-            if (ImGui::Button(setLabel.c_str()))
-                BeginHotkeyCapture(&vk);
-            if (vk != 0) {
-                ImGui::SameLine();
-                const std::string clearLabel = std::string(I18n::Tr("hotkey_clear")) + "###hotkey_clear_" + idSuffix;
-                if (ImGui::Button(clearLabel.c_str()))
-                    vk = 0;
-            }
-        }
+        ImGui::EndDisabled();
+        PluginUi::Tip(KitText("plugin_kit_clear_tip", "Removes the binding."));
         return boundNow;
+    }
+
+    // The hold hotkey and what holding it does: hide everything the plugin draws (the
+    // default) or show it only then. Label-left rows (NinjaPricerUi::LabelRows); the mode is
+    // dimmed while no key is bound (it does nothing then).
+    void DrawHoldHotkeyRows() {
+        const char* keyLabel = I18n::Tr("overlay_hold_key");
+        const char* modeLabel = I18n::Tr("overlay_hold_mode");
+        const char* hideLabel = I18n::TrId("overlay_hold_to_hide");
+        const char* showLabel = I18n::TrId("overlay_hold_to_show");
+        const NinjaPricerUi::LabelRows rows({ keyLabel, modeLabel },
+            (std::max)({ NinjaPricerUi::HotkeyButtonsMinWidth(), NinjaPricerUi::RadioWidth(hideLabel),
+                         NinjaPricerUi::RadioWidth(showLabel) }));
+
+        rows.Row(keyLabel);
+        DrawHotkeyButton("hold", m_HoldHotkey, I18n::Tr("hotkey_tip"));
+
+        rows.Row(modeLabel);
+        ImGui::BeginDisabled(m_HoldHotkey == 0);
+        int mode = static_cast<int>(m_HoldMode);
+        ImGui::RadioButton(hideLabel, &mode, static_cast<int>(HoldKeyMode::HideWhileHeld));
+        PluginUi::Tip(I18n::Tr("overlay_hold_to_hide_tip"));
+        // The second choice goes under the first when the row has no room for it.
+        ImGui::SameLine();
+        if (ImGui::GetContentRegionAvail().x < NinjaPricerUi::RadioWidth(showLabel)) {
+            ImGui::NewLine();
+            ImGui::SetCursorPosX(rows.ControlsX());
+        }
+        ImGui::RadioButton(showLabel, &mode, static_cast<int>(HoldKeyMode::ShowWhileHeld));
+        PluginUi::Tip(I18n::Tr("overlay_hold_to_show_tip"));
+        ImGui::EndDisabled();
+        m_HoldMode = static_cast<HoldKeyMode>(mode);
+    }
+
+    // Everything the plugin draws is hidden this frame by the hold hotkey (no key: never).
+    bool HiddenByHoldHotkey() const {
+        if (m_HoldHotkey == 0) return false;
+        const bool held = (GetAsyncKeyState(m_HoldHotkey) & 0x8000) != 0;
+        return m_HoldMode == HoldKeyMode::ShowWhileHeld ? !held : held;
     }
 
     void DrawTabOverlayToggles() {
@@ -541,8 +748,13 @@ public:
         if (ImGui::TreeNode(I18n::TrId("rswin_advanced"))) {
             ImGui::Spacing();
 
-            if (DrawHotkeyCaptureRow(I18n::Tr("rswin_hotkey"), "rswin", m_RuneshapeWinHotkey))
-                m_RuneshapeWinHotkeyWasDown = true;   // key is down right now — don't fire the toggle
+            {
+                const char* hotkeyLabel = I18n::Tr("rswin_hotkey");
+                const NinjaPricerUi::LabelRows rows({ hotkeyLabel }, NinjaPricerUi::HotkeyButtonsMinWidth());
+                rows.Row(hotkeyLabel);
+                if (DrawHotkeyButton("rswin", m_RuneshapeWinHotkey, I18n::Tr("hotkey_tip")))
+                    m_RuneshapeWinHotkeyWasDown = true;   // key is down right now — don't fire the toggle
+            }
 
             ImGui::Checkbox(I18n::TrId("rswin_hide_on_hover"), &m_RuneshapeWinHideOnHover);
             NinjaPricerText::Tooltip(I18n::Tr("rswin_hide_on_hover_tip"));
@@ -594,7 +806,7 @@ public:
 
         ImGui::Separator();
 
-        DrawHotkeyCaptureRow(I18n::Tr("overlay_hold_hotkey"), "hold", m_HideHotkey);
+        DrawHoldHotkeyRows();
     }
 
     // ========================================================================
@@ -606,7 +818,6 @@ public:
             ImGui::SetCurrentContext(static_cast<ImGuiContext*>(ctx()->ImGuiContext));
 
         if (m_HideWhenUnfocused && !IsGameWindowFocused()) return;
-        if (m_HideHotkey != 0 && (GetAsyncKeyState(m_HideHotkey) & 0x8000)) return;
 
         // Per-frame gates use cheap accessors — NOT GetSnapshot(), which enumerates
         // every entity (hundreds–1000+ in a busy map). The only thing that needs the
@@ -618,6 +829,8 @@ public:
         // Paused while a capture row is armed in the settings UI; right after a
         // capture completes, m_RuneshapeWinHotkeyWasDown was set true, so the
         // still-held freshly-bound key doesn't immediately toggle the window.
+        // Read before the hold hotkey's gate: with "hold to show" the overlay is
+        // hidden most of the time, and the toggle must work then too.
         if (m_RuneshapeWinHotkey != 0 && m_CaptureTarget == nullptr) {
             const bool down = (GetAsyncKeyState(m_RuneshapeWinHotkey) & 0x8000) != 0;
             if (down && !m_RuneshapeWinHotkeyWasDown) {
@@ -625,6 +838,32 @@ public:
                 SaveSettings();
             }
             m_RuneshapeWinHotkeyWasDown = down;
+        }
+
+        if (HiddenByHoldHotkey()) {
+            // The Runeshape window is not submitted: release this plugin's input request
+            // with it ("hold to show" keeps the overlay hidden most of the time).
+            ctx()->Overlay.SetWantsOverlayInput(false);
+            if (!m_HoldHidden) {
+                m_HoldHidden = true;
+                m_HoldHiddenSince = std::chrono::steady_clock::now();
+            }
+            return;
+        }
+        if (m_HoldHidden) {
+            m_HoldHidden = false;
+            // Nothing read the inventories while hidden: the snapshot is as old as the hidden
+            // stretch. Longer than the idle refresh it may show another stash tab or moved
+            // items ("hold to show" hides for minutes), so it is dropped and a read requested
+            // now: those prices return one read later (kInvReadDelayMs). Ground and Runeshape
+            // rows rescan on this frame by themselves (their intervals have passed).
+            if (std::chrono::steady_clock::now() - m_HoldHiddenSince >
+                std::chrono::milliseconds(kInvIdleScanIntervalMs)) {
+                m_CachedInventories.clear();
+                m_RarityCache.clear();
+                m_InvReadPending = false;
+                m_LastInventoryScan = {};
+            }
         }
 
         uint64_t areaChange = ctx()->Game.GetAreaChangeCounter();
@@ -827,7 +1066,8 @@ public:
             j["rsWinShowRewardPrice"] = m_RsShowRowPrice;
             j["rsWinShowPropRunes"] = m_RsShowRowPropRunes;
             j["hideWhenUnfocused"] = m_HideWhenUnfocused;
-            j["hideHotkey"] = m_HideHotkey;
+            j["hideHotkey"] = m_HoldHotkey;
+            j["holdHotkeyMode"] = static_cast<int>(m_HoldMode);
             j["uiPricePosition"] = static_cast<int>(m_UiPricePosition);
             j["groundPricePosition"] = static_cast<int>(m_GroundPricePosition);
             j["priceDisplayStyle"] = static_cast<int>(m_PriceDisplayStyle);
@@ -2627,7 +2867,11 @@ private:
             if (j.contains("hideWhenUnfocused") && j["hideWhenUnfocused"].is_boolean())
                 m_HideWhenUnfocused = j["hideWhenUnfocused"].get<bool>();
             if (j.contains("hideHotkey") && j["hideHotkey"].is_number_integer())
-                m_HideHotkey = j["hideHotkey"].get<int>();
+                m_HoldHotkey = j["hideHotkey"].get<int>();
+            // Any value but "show while held" (1) is the old behaviour, hide while held.
+            if (j.contains("holdHotkeyMode") && j["holdHotkeyMode"].is_number_integer())
+                m_HoldMode = j["holdHotkeyMode"].get<int>() == static_cast<int>(HoldKeyMode::ShowWhileHeld)
+                    ? HoldKeyMode::ShowWhileHeld : HoldKeyMode::HideWhileHeld;
             if (j.contains("uiPricePosition") && j["uiPricePosition"].is_number_integer())
                 m_UiPricePosition =
                     static_cast<UiPricePosition>(j["uiPricePosition"].get<int>());
@@ -2662,7 +2906,10 @@ private:
     bool m_ShowRuneshapeWeights = true;       // On by default — total rune weight per combination (host RuneShape tab weights)
     bool m_ShowItemIcons = true;              // On by default — item icon left of price tag
     bool m_HideWhenUnfocused = true;
-    int m_HideHotkey = 0;
+    int m_HoldHotkey = 0;   // VK of the hold hotkey ("hideHotkey" in the file); 0 = unbound
+    HoldKeyMode m_HoldMode = HoldKeyMode::HideWhileHeld;
+    bool m_HoldHidden = false;                              // hidden by the hold hotkey last frame
+    std::chrono::steady_clock::time_point m_HoldHiddenSince;   // since when (not persisted)
     UiPricePosition m_UiPricePosition = UiPricePosition::BottomRight;
     GroundPricePosition m_GroundPricePosition = GroundPricePosition::Top;
 
@@ -2848,6 +3095,6 @@ extern "C" PLUGIN_API void DestroyPlugin(PluginSDK::Plugin* plugin) {
 POEFIXER_PLUGIN_INFO(
     "NinjaPricer",
     "Ninja Pricer",
-    "1.0.4",
+    "1.0.5",
     "POEFixer",
     "Shows item prices on dropped items, in your inventory and stash, in the Ritual shop and on Runeshape rewards.")

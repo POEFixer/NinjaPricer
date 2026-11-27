@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.0.5
+
+- The hold hotkey (Overlay Toggles tab) has a mode: **Hold to hide** (as before: prices and the Runeshape window disappear while the key is held) or **Hold to show** (they stay hidden and appear only while the key is held). Without a hotkey the mode does nothing; settings saved by an older version keep Hold to hide.
+- Hotkeys look like the other plugin settings: the key on a button you click to change it, a quiet Clear beside it. The key code is no longer shown. Keyboard keys carry the plugin kit's English names, as in the other plugins (the arrow keys, Insert, Delete, Home, End, Page Up / Down and Num Lock showed as numpad keys or Pause before); punctuation keys show the character your keyboard layout puts on them (Ü, Ж, ...). A key the plugin cannot name is not bound.
+- While a hotkey waits for a key, a left click elsewhere cancels, as Esc does; the left mouse button is never bound (one bound by an older version keeps working).
+- The Runeshape window's show/hide hotkey also works while the hold hotkey hides the overlay.
+- In a narrow settings tab or with a large font the hotkey rows put their controls under their labels instead of past the tab's edge.
+
 ## 1.0.4
 
 - Built with the current plugin SDK: a controller that is not XInput reports no port (-1) even when ready.
